@@ -218,30 +218,39 @@ export async function mpChargeCard({
   return { status: pay.status, paymentId: pay.id };
 }
 
-// backend/src/services/mercadopago.js
-// ... (tudo que você já tem permanece igual acima)
-
-//
-// === PIX (v1/payments) ===============================================
-//
-// Cria um pagamento PIX direto no MP.
-// Você pode chamar com:
-//  - { amount_cents }            -> valor total em centavos
-//  - { unit_price, quantity }    -> valor em reais * quantidade
-//
-// Retorna: { id, status, qr_code, qr_code_base64, ticket_url, raw }
-//
-export async function createMercadoPagoPreferenceOrPix({
-  title,
-  amount_cents,            // em centavos (prioritário se informado)
-  unit_price,              // em reais
+/* ========================================================================
+   PIX: criação de pagamento via /v1/payments (exige payer_email)
+   ===================================================================== */
+/**
+ * Cria um pagamento PIX direto no Mercado Pago.
+ * Params:
+ *  - amount_cents  (prioritário)    OU  unit_price (reais) + quantity
+ *  - description
+ *  - payer_email   (OBRIGATÓRIO)
+ *  - payer_name    (opcional)
+ *  - payer_doc     (opcional) -> { type: 'CPF'|'CNPJ', number: '...' }
+ *  - external_reference, notification_url, expires_minutes, metadata
+ *
+ * Retorna: { id, status, qr_code, qr_code_base64, copy_paste_code, ticket_url }
+ */
+export async function createPixPayment({
+  amount_cents,
+  unit_price,
   quantity = 1,
+  description = "Compra e-book",
+  payer_email,
+  payer_name,
+  payer_doc, // { type, number }
+  external_reference,
+  notification_url,
+  expires_minutes = 30,
   metadata = {},
-  payer = {},              // { email, name, identification?: { type, number } }
 }) {
-  ensureToken();
+  if (!payer_email) {
+    throw new Error("payer_email_is_required");
+  }
 
-  // calcula o total em reais
+  // calcula valor em reais
   let totalReais;
   if (amount_cents != null) {
     totalReais = toBRL(amount_cents);
@@ -257,38 +266,71 @@ export async function createMercadoPagoPreferenceOrPix({
     "/v1/payments",
     {
       transaction_amount: totalReais,
-      description: title || "E-book",
+      description,
       payment_method_id: "pix",
       installments: 1,
       metadata,
+      external_reference: external_reference || undefined,
+      notification_url: notification_url || undefined,
+      date_of_expiration: new Date(
+        Date.now() + Number(expires_minutes) * 60 * 1000
+      ).toISOString(),
       payer: {
-        email: payer.email || undefined,
-        first_name: payer.name || undefined,
-        identification: payer.identification || undefined, // { type, number }
+        email: String(payer_email),
+        first_name: payer_name || undefined,
+        identification: payer_doc || undefined, // { type, number }
       },
-      // binary_mode: true, // (opcional para cartão; PIX não precisa)
     },
     { "X-Idempotency-Key": idempotencyKey }
   );
 
   const tx = pay?.point_of_interaction?.transaction_data || {};
   return {
-    id: pay.id,
-    status: pay.status,                  // geralmente "pending"
-    qr_code: tx.qr_code || null,         // copia & cola
-    qr_code_base64: tx.qr_code_base64 || null,
-    ticket_url: tx.ticket_url || null,   // página do QR
-    raw: pay,
+    id: String(pay.id),
+    status: pay.status,                    // geralmente "pending"
+    qr_code: tx.qr_code || null,           // copia & cola
+    qr_code_base64: (tx.qr_code_base64 || "").replace(/\s+/g, "") || null,
+    copy_paste_code: tx.qr_code || null,
+    ticket_url: tx.ticket_url || null,     // página do QR
   };
 }
 
-// export default já existente — apenas inclua a função nova:
+/* ------------------------------------------------------------------------
+   Compat: antiga função usada no projeto. Encaminha para createPixPayment.
+   Mantida para não quebrar chamadas existentes.
+------------------------------------------------------------------------- */
+export async function createMercadoPagoPreferenceOrPix(args = {}) {
+  const {
+    title,
+    amount_cents,
+    unit_price,
+    quantity,
+    metadata,
+    payer,
+    external_reference,
+    notification_url,
+    expires_minutes,
+  } = args;
+
+  return createPixPayment({
+    amount_cents,
+    unit_price,
+    quantity,
+    description: title || "E-book",
+    metadata,
+    payer_email: payer?.email,
+    payer_name: payer?.name,
+    payer_doc: payer?.identification,
+    external_reference,
+    notification_url,
+    expires_minutes,
+  });
+}
+
 export default {
   mpEnsureCustomer,
   mpSaveCard,
   mpChargeCard,
-  createMercadoPagoPreferenceOrPix, // 👈 adicionar aqui
+  createPixPayment,
+  createMercadoPagoPreferenceOrPix, // compat
 };
-
-
-

@@ -24,18 +24,11 @@ const PIX_EXP_MIN = Math.max(
 // Helpers
 // -----------------------------------------------------------------------------
 
-/**
- * Fecha o draw se tiver 100 vendidos e cria um novo se não existir outro 'open'.
- * Tudo dentro de TRANSAÇÃO + ADVISORY LOCK para evitar condições de corrida.
- */
 async function finalizeDrawIfComplete(drawId) {
-  // Inicia transação e trava seção crítica
   await query('BEGIN');
   try {
-    // trava global simples (escopo transação)
     await query('SELECT pg_advisory_xact_lock(911001)');
 
-    // Trava a linha do draw e revalida status
     const cur = await query(
       `SELECT id, status, closed_at
          FROM draws
@@ -43,13 +36,11 @@ async function finalizeDrawIfComplete(drawId) {
         FOR UPDATE`,
       [drawId]
     );
-
     if (!cur.rows.length) {
       await query('ROLLBACK');
       return;
     }
 
-    // Reconta vendidos sob a mesma transação
     const cnt = await query(
       `SELECT COUNT(*)::int AS sold
          FROM numbers
@@ -59,7 +50,6 @@ async function finalizeDrawIfComplete(drawId) {
     const sold = cnt.rows[0]?.sold || 0;
 
     if (sold === 100) {
-      // Fecha (idempotente)
       await query(
         `UPDATE draws
             SET status = 'closed',
@@ -68,7 +58,6 @@ async function finalizeDrawIfComplete(drawId) {
         [drawId]
       );
 
-      // Abre novo SOMENTE se não existir outro aberto
       const ins = await query(
         `WITH chk AS (
            SELECT 1 FROM draws WHERE status = 'open' LIMIT 1
@@ -81,7 +70,6 @@ async function finalizeDrawIfComplete(drawId) {
 
       const newId = ins.rows[0]?.id;
       if (newId) {
-        // Popula 0..99
         await query(
           `INSERT INTO numbers (draw_id, n, status)
            SELECT $1, gs, 'available'
@@ -94,17 +82,11 @@ async function finalizeDrawIfComplete(drawId) {
     await query('COMMIT');
   } catch (e) {
     try { await query('ROLLBACK'); } catch {}
-    // Loga e segue; idempotência garante consistência em nova tentativa
     console.error('[finalizeDrawIfComplete] error:', e);
   }
 }
 
-/**
- * Marca números como vendidos para um pagamento aprovado
- * e marca a reserva (se houver) como 'paid'.
- */
 async function settleApprovedPayment(id, drawId, numbers) {
-  // marca números como vendidos
   await query(
     `UPDATE numbers
         SET status = 'sold',
@@ -114,7 +96,6 @@ async function settleApprovedPayment(id, drawId, numbers) {
     [drawId, numbers]
   );
 
-  // marca reserva como paga (idempotente)
   await query(
     `UPDATE reservations
         SET status = 'paid'
@@ -142,7 +123,6 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'missing_reservation' });
     }
 
-    // Corrige reservas antigas sem user_id (anexa ao usuário atual)
     await query(
       `UPDATE reservations
           SET user_id = $2
@@ -151,7 +131,6 @@ router.post('/pix', requireAuth, async (req, res) => {
       [reservationId, req.user.id]
     );
 
-    // Carrega a reserva + (opcional) usuário
     const r = await query(
       `SELECT r.id, r.user_id, r.draw_id, r.numbers, r.status, r.expires_at,
               u.email AS user_email, u.name AS user_name
@@ -169,11 +148,9 @@ router.post('/pix', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'reservation_expired' });
     }
 
-    // Valor (preço * quantidade) — vindo do banco
     const priceCents = await getTicketPriceCents();
     const amount = Number(((rs.numbers.length * priceCents) / 100).toFixed(2));
 
-    // Descrição e webhook
     const description = `Sorteio New Store - números ${rs.numbers
       .map((n) => n.toString().padStart(2, '0'))
       .join(', ')}`;
@@ -181,10 +158,8 @@ router.post('/pix', requireAuth, async (req, res) => {
     const baseUrl = (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
     const notification_url = `${baseUrl}/api/payments/webhook`;
 
-    // E-mail do pagador
     const payerEmail = rs.user_email || req.user?.email || 'comprador@example.com';
 
-    // Cria pagamento PIX no Mercado Pago (idempotente)
     const mpResp = await mpPayment.create({
       body: {
         transaction_amount: amount,
@@ -202,12 +177,10 @@ router.post('/pix', requireAuth, async (req, res) => {
     const { id, status, point_of_interaction } = body || {};
     const td = point_of_interaction?.transaction_data || {};
 
-    // Normaliza QR/copia-e-cola
     let { qr_code, qr_code_base64 } = td;
     if (typeof qr_code_base64 === 'string') qr_code_base64 = qr_code_base64.replace(/\s+/g, '');
     if (typeof qr_code === 'string') qr_code = qr_code.trim();
 
-    // Persiste o pagamento
     await query(
       `INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -227,7 +200,6 @@ router.post('/pix', requireAuth, async (req, res) => {
       ]
     );
 
-    // Amarra a reserva ao pagamento (status segue 'active' até aprovar)
     await query(`UPDATE reservations SET payment_id = $2 WHERE id = $1`, [reservationId, String(id)]);
 
     return res.json({ paymentId: String(id), status, qr_code, qr_code_base64 });
@@ -302,7 +274,6 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Sempre 200 para o MP não reenfileirar indefinidamente
     return res.sendStatus(200);
   } catch (e) {
     console.error('[webhook] error:', e);
@@ -310,8 +281,7 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// === LISTA MEUS PAGAMENTOS (para a conta) ===
-// GET /api/payments/me  -> { payments: [...] }
+// === LISTA MEUS PAGAMENTOS (para a conta)
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const r = await query(
@@ -336,13 +306,12 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 /* ============================================================================
-   NOVOS ENDPOINTS — adicionados sem alterar os existentes
+   NOVOS ENDPOINTS
    ========================================================================== */
 
 /**
  * POST /api/payments/reconcile
  * Body: { since?: number }  // minutos a varrer (default 1440 = 24h)
- * Varre pagamentos não aprovados recentes, consulta o MP e assenta se aprovado.
  */
 router.post('/reconcile', requireAuth, async (req, res) => {
   try {
@@ -397,7 +366,6 @@ router.post('/reconcile', requireAuth, async (req, res) => {
 /**
  * POST /api/payments/webhook/replay
  * Body: { id: string }  // paymentId
- * Reexecuta a lógica do webhook para um pagamento específico.
  */
 router.post('/webhook/replay', requireAuth, async (req, res) => {
   try {
@@ -434,9 +402,12 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/payments/infoproduct
-// body: { infoproduct_id?: number, infoproduct_sku?: string }
-router.post('/infoproduct', async (req, res) => {
+/**
+ * POST /api/payments/infoproduct
+ * Body: { infoproduct_id?: number, infoproduct_sku?: string }
+ * Auth: Bearer  (exige usuário logado para termos um payer_email válido)
+ */
+router.post('/infoproduct', requireAuth, async (req, res) => {
   try {
     const { infoproduct_id, infoproduct_sku } = req.body || {};
     if (!infoproduct_id && !infoproduct_sku) {
@@ -458,9 +429,10 @@ router.post('/infoproduct', async (req, res) => {
     const p = rows[0];
     if (!p) return res.status(404).json({ error: 'infoproduct_not_found' });
 
-    // dados do pagador (se usuário estiver logado via cookie/JWT)
-    const payerEmail = req.user?.email || undefined;
+    // dados do pagador (obrigatório: login garante e-mail)
+    const payerEmail = req.user?.email;
     const payerName  = req.user?.name  || undefined;
+    if (!payerEmail) return res.status(401).json({ error: 'unauthorized' });
 
     // cria pagamento PIX no Mercado Pago
     const mpPix = await createMercadoPagoPreferenceOrPix({
@@ -470,7 +442,6 @@ router.post('/infoproduct', async (req, res) => {
         kind: 'infoproduct',
         infoproduct_id: p.id,
         sku: p.sku || null,
-        // você pode colocar também um user_id aqui, se quiser
         user_id: req.user?.id || null,
       },
       payer: {
@@ -479,11 +450,9 @@ router.post('/infoproduct', async (req, res) => {
       },
     });
 
-    // mpPix.id é o ID do pagamento no MP — use-o como chave primária
     const paymentId = String(mpPix.id);
     const status    = String(mpPix.status || 'pending');
 
-    // persiste o registro local (sem draw, sem números)
     await query(
       `
       INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64, created_at)
@@ -498,12 +467,11 @@ router.post('/infoproduct', async (req, res) => {
         req.user?.id || null,
         p.price_cents,
         status,
-        mpPix.qr_code || null,         // código copia e cola
-        mpPix.qr_code_base64 || null,  // imagem do QR em base64
+        mpPix.qr_code || null,
+        mpPix.qr_code_base64 || null,
       ]
     );
 
-    // resposta para o front
     return res.json({
       paymentId,
       amount_cents: p.price_cents,
@@ -517,6 +485,5 @@ router.post('/infoproduct', async (req, res) => {
     return res.status(500).json({ error: 'create_infoproduct_payment_failed' });
   }
 });
-
 
 export default router;
