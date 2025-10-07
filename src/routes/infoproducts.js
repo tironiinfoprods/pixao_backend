@@ -160,4 +160,111 @@ router.get("/:idOrSku", async (req, res) => {
   }
 });
 
+// === GARANTE DRAW ABERTO PARA UM INFOPRODUTO (cria se não existir/estiver cheio) ===
+
+router.post("/:idOrSku/ensure-open-draw", async (req, res) => {
+  const pool = await getPool();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const idOrSku = (req.params.idOrSku ?? "").trim();
+    const isNumeric = /^\d+$/.test(idOrSku);
+
+    // Carrega o e-book + categoria + defaults
+    const { rows: pr } = await client.query(
+      `
+      SELECT
+        p.id, p.sku,
+        COALESCE(p.category_id, c.id)         AS category_id,
+        COALESCE(p.default_total_numbers,100) AS total_numbers,
+        COALESCE(p.default_prize_cents,0)     AS prize_cents
+      FROM infoproducts p
+      LEFT JOIN categories c ON LOWER(c.slug) = LOWER(p.subtitle)  -- fallback
+      WHERE ${isNumeric ? "p.id = $1" : "LOWER(p.sku) = LOWER($1)"}
+      LIMIT 1
+      `,
+      [idOrSku]
+    );
+    const P = pr[0];
+    if (!P) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "infoproduct_not_found" });
+    }
+    if (!P.category_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "infoproduct_missing_category" });
+    }
+
+    // Tenta travar o draw "open" mais recente desse produto
+    const { rows: drows } = await client.query(
+      `
+      SELECT id, total_numbers
+      FROM draws
+      WHERE infoproduct_id = $1 AND status = 'open'
+      ORDER BY id DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [P.id]
+    );
+
+    let drawId = drows[0]?.id ?? null;
+    let totalNumbers = drows[0]?.total_numbers ?? P.total_numbers;
+
+    // Se havia draw aberto, veja se encheu
+    if (drawId) {
+      const { rows: usedRows } = await client.query(
+        `
+        SELECT COUNT(*)::int AS used
+        FROM numbers
+        WHERE draw_id = $1 AND status IN ('reserved','taken','sold')
+        `,
+        [drawId]
+      );
+      const used = usedRows[0]?.used ?? 0;
+      if (used >= totalNumbers) {
+        await client.query(
+          `UPDATE draws SET status='closed', closed_at=NOW() WHERE id=$1`,
+          [drawId]
+        );
+        drawId = null; // força criar outro
+      }
+    }
+
+    // Se não há draw aberto ou foi fechado por estar cheio -> cria novo + popula 0..N-1
+    if (!drawId) {
+      const ins = await client.query(
+        `
+        INSERT INTO draws (infoproduct_id, category_id, status, total_numbers, prize_cents)
+        VALUES ($1,$2,'open',$3,$4)
+        RETURNING id, total_numbers
+        `,
+        [P.id, P.category_id, P.total_numbers, P.prize_cents]
+      );
+      drawId = ins.rows[0].id;
+      totalNumbers = ins.rows[0].total_numbers;
+
+      await client.query(
+        `
+        INSERT INTO numbers (draw_id, n, status)
+        SELECT $1, gs::int, 'available'
+        FROM generate_series(0, $2-1) gs
+        `,
+        [drawId, totalNumbers]
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.json({ draw_id: drawId, total_numbers: totalNumbers });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("[ensure-open-draw] fail:", e);
+    return res.status(500).json({ error: "ensure_open_draw_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+
 export default router;

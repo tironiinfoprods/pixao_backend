@@ -1,61 +1,78 @@
 // backend/src/routes/numbers.js
-import { Router } from 'express';
-import { query } from '../db.js';
+import { Router } from "express";
+import { query } from "../db.js";
 
 const router = Router();
 
-// gera duas iniciais a partir do nome; se não tiver nome, usa o usuário do e-mail
+/**
+ * Gera duas iniciais a partir do nome; se não tiver nome, usa o usuário do e-mail.
+ */
 function initialsFromNameOrEmail(name, email) {
-  const nm = String(name || '').trim();
+  const nm = String(name || "").trim();
   if (nm) {
     const parts = nm.split(/\s+/).filter(Boolean);
-    const first = parts[0]?.[0] || '';
-    const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || '');
+    const first = parts[0]?.[0] || "";
+    const last =
+      parts.length > 1 ? parts[parts.length - 1][0] : parts[0]?.[1] || "";
     return (first + last).toUpperCase();
   }
-  const mail = String(email || '').trim();
-  const user = mail.includes('@') ? mail.split('@')[0] : mail;
+  const mail = String(email || "").trim();
+  const user = mail.includes("@") ? mail.split("@")[0] : mail;
   return user.slice(0, 2).toUpperCase();
 }
 
 /**
  * GET /api/numbers
- * - Pega o draw aberto
- * - Lê todos os números do draw (0..99) a partir da tabela numbers
- * - Marca como "sold" (indisponível) os números que têm pagamento aprovado
- * - Marca como "reserved" os números com reserva ativa (não expirada)
- * - Faz lazy-expire das reservas vencidas (best-effort)
- * - Retorna o status final para cada número
- * - (NOVO) Para números vendidos, inclui "owner_initials" (iniciais do comprador)
+ * Preferencialmente use:  /api/numbers?draw_id=123
+ *  - Se draw_id NÃO vier, cai no fallback do último draw 'open'.
+ * Retorna: { drawId, numbers: [{ n, status, owner_initials? }] }
+ * status ∈ 'available' | 'reserved' | 'sold'
  */
-router.get('/', async (_req, res) => {
+router.get("/", async (req, res) => {
   try {
-    // 1) draw aberto
-    const dr = await query(
-      `SELECT id FROM draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
-    );
-    if (!dr.rows.length) return res.json({ drawId: null, numbers: [] });
-    const drawId = dr.rows[0].id;
+    // 0) resolve draw_id (param) ou último aberto (fallback)
+    let drawId = Number.parseInt(req.query.draw_id ?? "", 10);
+    if (!Number.isFinite(drawId)) {
+      const dr = await query(
+        `SELECT id FROM draws WHERE status = 'open' ORDER BY id DESC LIMIT 1`
+      );
+      if (!dr.rows.length) {
+        return res.json({ drawId: null, numbers: [] });
+      }
+      drawId = dr.rows[0].id;
+    }
 
-    // 2) lista base de números 0..99
-    const base = await query(
+    // 1) lista base de números do draw
+    let base = await query(
       `SELECT n FROM numbers WHERE draw_id = $1 ORDER BY n ASC`,
       [drawId]
     );
 
-    // 3) pagos => SOLD + iniciais do comprador
-    //    Usamos UNNEST para explodir o array de números pagos
+    // fallback: se a tabela 'numbers' ainda não estiver populada,
+    // gera o range com base no total_numbers do draw (não bloqueia se não existir)
+    if (!base.rows.length) {
+      const drInfo = await query(
+        `SELECT total_numbers FROM draws WHERE id = $1`,
+        [drawId]
+      );
+      const total = drInfo.rows?.[0]?.total_numbers ?? 100;
+      base = {
+        rows: Array.from({ length: total }, (_, i) => ({ n: i })),
+      };
+    }
+
+    // 2) pagos => SOLD + iniciais do comprador
     const pays = await query(
       `
       SELECT
-        num.n::int       AS n,
-        u.name           AS owner_name,
-        u.email          AS owner_email
+        num.n::int AS n,
+        u.name     AS owner_name,
+        u.email    AS owner_email
       FROM payments p
       LEFT JOIN users u ON u.id = p.user_id
       CROSS JOIN LATERAL unnest(p.numbers) AS num(n)
       WHERE p.draw_id = $1
-        AND lower(p.status) IN ('approved','paid','pago')
+        AND lower(coalesce(p.status,'')) IN ('approved','paid','pago','captured','success')
       `,
       [drawId]
     );
@@ -68,12 +85,14 @@ router.get('/', async (_req, res) => {
       initialsByN.set(num, ini);
     }
 
-    // 4) reservas ativas; ignora expiradas (e tenta expirar em background)
+    // 3) reservas ativas (ignora expiradas e faz lazy-expire)
     const resvs = await query(
-      `SELECT id, numbers, status, expires_at
-         FROM reservations
-        WHERE draw_id = $1
-          AND lower(coalesce(status,'')) IN ('active','pending','reserved','')`,
+      `
+      SELECT id, numbers, status, expires_at
+      FROM reservations
+      WHERE draw_id = $1
+        AND lower(coalesce(status,'')) IN ('active','pending','reserved','')
+      `,
       [drawId]
     );
 
@@ -86,32 +105,36 @@ router.get('/', async (_req, res) => {
 
       if (isExpired) {
         // best-effort: não bloqueia a resposta
-        query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id])
-          .catch(() => {});
+        query(`UPDATE reservations SET status = 'expired' WHERE id = $1`, [r.id]).catch(
+          () => {}
+        );
         continue;
       }
 
-      // reserva só se ainda não foi vendida
-      for (const n of (r.numbers || [])) {
+      for (const n of r.numbers || []) {
         const num = Number(n);
         if (!sold.has(num)) reserved.add(num);
       }
     }
 
-    // 5) status final por número (+ owner_initials quando sold)
+    // 4) status final por número (+ owner_initials quando sold)
     const numbers = base.rows.map(({ n }) => {
       const num = Number(n);
       if (sold.has(num)) {
-        return { n: num, status: 'sold', owner_initials: initialsByN.get(num) || null };
+        return {
+          n: num,
+          status: "sold",
+          owner_initials: initialsByN.get(num) || null,
+        };
       }
-      if (reserved.has(num)) return { n: num, status: 'reserved' };
-      return { n: num, status: 'available' };
+      if (reserved.has(num)) return { n: num, status: "reserved" };
+      return { n: num, status: "available" };
     });
 
-    res.json({ drawId, numbers });
+    return res.json({ drawId, numbers });
   } catch (err) {
-    console.error('GET /api/numbers failed', err);
-    res.status(500).json({ error: 'failed_to_list_numbers' });
+    console.error("GET /api/numbers failed", err);
+    return res.status(500).json({ error: "failed_to_list_numbers" });
   }
 });
 
