@@ -5,6 +5,7 @@ import { query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { getTicketPriceCents } from '../services/config.js';
+import { createMercadoPagoPreferenceOrPix } from '../services/mercadopago.js';
 
 const router = Router();
 
@@ -435,49 +436,85 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
 
 // POST /api/payments/infoproduct
 // body: { infoproduct_id?: number, infoproduct_sku?: string }
-router.post("/infoproduct", async (req, res) => {
+router.post('/infoproduct', async (req, res) => {
   try {
     const { infoproduct_id, infoproduct_sku } = req.body || {};
     if (!infoproduct_id && !infoproduct_sku) {
-      return res.status(400).json({ error: "missing_infoproduct" });
+      return res.status(400).json({ error: 'missing_infoproduct' });
     }
 
-    // carrega o e-book
-    const col = infoproduct_id ? "id" : "sku";
+    // carrega o e-book (traga title/sku para metadata)
     const val = infoproduct_id || String(infoproduct_sku);
-    const { rows } = await query(`
-      SELECT id, price_cents
-      FROM infoproducts
-      WHERE ${infoproduct_id ? "id = $1" : "LOWER(sku)=LOWER($1)"} AND active = true
-      LIMIT 1
-    `, [val]);
+    const { rows } = await query(
+      `
+      SELECT id, sku, title, price_cents
+        FROM infoproducts
+       WHERE ${infoproduct_id ? 'id = $1' : 'LOWER(sku)=LOWER($1)'}
+         AND active = true
+       LIMIT 1
+      `,
+      [val]
+    );
     const p = rows[0];
-    if (!p) return res.status(404).json({ error: "infoproduct_not_found" });
+    if (!p) return res.status(404).json({ error: 'infoproduct_not_found' });
 
-    // cria registro de pagamento "pendente" amarrado ao infoproduto (sem draw/sem números)
-    const paymentId = String(Date.now()); // ou UUID
-    await query(`
-      INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, created_at)
-      VALUES ($1, $2, NULL, '{}'::smallint[], $3, 'pending', NOW())
-    `, [paymentId, req.user?.id || null, p.price_cents]);
+    // dados do pagador (se usuário estiver logado via cookie/JWT)
+    const payerEmail = req.user?.email || undefined;
+    const payerName  = req.user?.name  || undefined;
 
-    // gere o PIX (reaproveite sua função existente)
-    const pix = await createMercadoPagoPreferenceOrPix({
-      id: paymentId,
+    // cria pagamento PIX no Mercado Pago
+    const mpPix = await createMercadoPagoPreferenceOrPix({
+      title: p.title || 'E-book',
       amount_cents: p.price_cents,
-      description: "Compra de e-book / 1 cota",
+      metadata: {
+        kind: 'infoproduct',
+        infoproduct_id: p.id,
+        sku: p.sku || null,
+        // você pode colocar também um user_id aqui, se quiser
+        user_id: req.user?.id || null,
+      },
+      payer: {
+        email: payerEmail,
+        name: payerName,
+      },
     });
 
+    // mpPix.id é o ID do pagamento no MP — use-o como chave primária
+    const paymentId = String(mpPix.id);
+    const status    = String(mpPix.status || 'pending');
+
+    // persiste o registro local (sem draw, sem números)
+    await query(
+      `
+      INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64, created_at)
+      VALUES ($1,  $2,      NULL,   '{}'::smallint[], $3,           $4,     $5,      $6,              NOW())
+      ON CONFLICT (id) DO UPDATE
+        SET status = EXCLUDED.status,
+            qr_code = COALESCE(EXCLUDED.qr_code, payments.qr_code),
+            qr_code_base64 = COALESCE(EXCLUDED.qr_code_base64, payments.qr_code_base64)
+      `,
+      [
+        paymentId,
+        req.user?.id || null,
+        p.price_cents,
+        status,
+        mpPix.qr_code || null,         // código copia e cola
+        mpPix.qr_code_base64 || null,  // imagem do QR em base64
+      ]
+    );
+
+    // resposta para o front
     return res.json({
       paymentId,
       amount_cents: p.price_cents,
-      qr_code: pix.qr_code,
-      qr_code_base64: pix.qr_code_base64,
-      copy_paste_code: pix.copy_paste_code,
+      status,
+      qr_code: mpPix.qr_code,
+      qr_code_base64: mpPix.qr_code_base64,
+      ticket_url: mpPix.ticket_url || null,
     });
   } catch (e) {
-    console.error("[payments/infoproduct]", e);
-    return res.status(500).json({ error: "create_infoproduct_payment_failed" });
+    console.error('[payments/infoproduct]', e);
+    return res.status(500).json({ error: 'create_infoproduct_payment_failed' });
   }
 });
 

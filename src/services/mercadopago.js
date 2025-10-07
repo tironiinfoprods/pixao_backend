@@ -218,4 +218,77 @@ export async function mpChargeCard({
   return { status: pay.status, paymentId: pay.id };
 }
 
-export default { mpEnsureCustomer, mpSaveCard, mpChargeCard };
+// backend/src/services/mercadopago.js
+// ... (tudo que você já tem permanece igual acima)
+
+//
+// === PIX (v1/payments) ===============================================
+//
+// Cria um pagamento PIX direto no MP.
+// Você pode chamar com:
+//  - { amount_cents }            -> valor total em centavos
+//  - { unit_price, quantity }    -> valor em reais * quantidade
+//
+// Retorna: { id, status, qr_code, qr_code_base64, ticket_url, raw }
+//
+export async function createMercadoPagoPreferenceOrPix({
+  title,
+  amount_cents,            // em centavos (prioritário se informado)
+  unit_price,              // em reais
+  quantity = 1,
+  metadata = {},
+  payer = {},              // { email, name, identification?: { type, number } }
+}) {
+  ensureToken();
+
+  // calcula o total em reais
+  let totalReais;
+  if (amount_cents != null) {
+    totalReais = toBRL(amount_cents);
+  } else {
+    const up = Number(unit_price || 0);
+    totalReais = Number((up * quantity).toFixed(2));
+  }
+
+  const idempotencyKey = crypto.randomUUID();
+
+  const pay = await mpFetch(
+    "POST",
+    "/v1/payments",
+    {
+      transaction_amount: totalReais,
+      description: title || "E-book",
+      payment_method_id: "pix",
+      installments: 1,
+      metadata,
+      payer: {
+        email: payer.email || undefined,
+        first_name: payer.name || undefined,
+        identification: payer.identification || undefined, // { type, number }
+      },
+      // binary_mode: true, // (opcional para cartão; PIX não precisa)
+    },
+    { "X-Idempotency-Key": idempotencyKey }
+  );
+
+  const tx = pay?.point_of_interaction?.transaction_data || {};
+  return {
+    id: pay.id,
+    status: pay.status,                  // geralmente "pending"
+    qr_code: tx.qr_code || null,         // copia & cola
+    qr_code_base64: tx.qr_code_base64 || null,
+    ticket_url: tx.ticket_url || null,   // página do QR
+    raw: pay,
+  };
+}
+
+// export default já existente — apenas inclua a função nova:
+export default {
+  mpEnsureCustomer,
+  mpSaveCard,
+  mpChargeCard,
+  createMercadoPagoPreferenceOrPix, // 👈 adicionar aqui
+};
+
+
+
