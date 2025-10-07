@@ -14,6 +14,7 @@ import paymentsRoutes from "./routes/payments.js";
 import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
+import adminInfoproducts from "./routes/admin.infoproducts.js";
 
 // ✅ NOVO: rota pública para listar infoprodutos/e-books
 import infoproductsRoutes from "./routes/infoproducts.js";
@@ -97,6 +98,8 @@ app.use("/api/participations", paymentsRoutes); // aliases
 app.use("/api/me", meRoutes);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
+
+app.use("/api/admin/infoproducts", adminInfoproducts);
 
 // ✅ NOVO: lista/busca infoprodutos (com filtro por categoria via ?category=slug)
 app.use("/api/infoproducts", infoproductsRoutes);
