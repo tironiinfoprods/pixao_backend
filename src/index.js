@@ -15,6 +15,9 @@ import meRoutes from "./routes/me.js";
 import drawsRoutes from "./routes/draws.js";
 import drawsExtRoutes from "./routes/draws_ext.js";
 
+// ✅ NOVO: rota pública para listar infoprodutos/e-books
+import infoproductsRoutes from "./routes/infoproducts.js";
+
 // Routers ADMIN específicos (monte ANTES do /api/admin genérico)
 import adminDrawsRouter from "./routes/admin_draws.js";
 import adminClientsRouter from "./routes/admin_clients.js";
@@ -68,7 +71,6 @@ const corsOptions = {
   origin: ORIGINS, // array de origens permitidas
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Deixe allowedHeaders indefinido para refletir os headers solicitados no preflight
   optionsSuccessStatus: 204,
 };
 
@@ -96,6 +98,9 @@ app.use("/api/me", meRoutes);
 app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 
+// ✅ NOVO: lista/busca infoprodutos (com filtro por categoria via ?category=slug)
+app.use("/api/infoproducts", infoproductsRoutes);
+
 // ── Rotas ADMIN específicas (antes do genérico) ────────────
 app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
@@ -117,10 +122,9 @@ app.use("/api/coupons", couponsRouter);
 
 app.use("/api/admin/users", adminUsersRouter);
 
+// Outros
 app.use("/api", autopayRouter);
-
 app.use("/api/me/draws", meDraws);
-
 app.use("/api/admin/autopay", autopayRunnerRoute);
 
 // 404 padrão
@@ -131,8 +135,8 @@ app.use((req, res) => {
 // ── Bootstrap ───────────────────────────────────────────────
 async function bootstrap() {
   try {
-    await ensureSchema(); // cria o schema base/tabelas
-    await ensureAppConfig(); // garante app_config e ticket_price_cents
+    await ensureSchema();     // cria/atualiza todas as tabelas (inclui infoproducts/categories)
+    await ensureAppConfig();  // garante app_config e ticket_price_cents
 
     const pool = await getPool();
     await pool.query("SELECT 1");
