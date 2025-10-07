@@ -20,15 +20,14 @@ function requireAdmin(req, res, next) {
 async function normalizeBody(body) {
   const out = {};
 
-  out.sku   = String(body.sku ?? "").trim();
+  out.sku = String(body.sku ?? "").trim();
   out.title = String(body.title ?? "").trim();
   out.subtitle = String(body.subtitle ?? "").trim();
   out.description = String(body.description ?? "").trim();
-  out.cover_url   = body.cover_url ?? null;
-  out.file_url    = body.file_url ?? null;
+  out.cover_url = body.cover_url ?? null;
+  out.file_url = body.file_url ?? null;
   out.file_sha256 = body.file_sha256 ?? null;
 
-  // aceita "1.00" BRL -> 100 cents
   const toCents = (v) => {
     if (v === null || v === undefined || v === "") return null;
     const n = Number(String(v).replace(",", "."));
@@ -36,13 +35,13 @@ async function normalizeBody(body) {
     return Math.round(n * 100);
   };
 
-  const price_cents  = body.price_cents ?? toCents(body.price);
-  const prize_cents  = body.default_prize_cents ?? toCents(body.prize);
+  const price_cents = body.price_cents ?? toCents(body.price);
+  const prize_cents = body.default_prize_cents ?? toCents(body.prize);
   const total_numbers = body.default_total_numbers ?? body.total_numbers ?? null;
 
-  out.price_cents            = price_cents ?? null;
-  out.default_prize_cents    = prize_cents ?? null;
-  out.default_total_numbers  = total_numbers ? Number(total_numbers) : null;
+  out.price_cents = price_cents ?? null;
+  out.default_prize_cents = prize_cents ?? null;
+  out.default_total_numbers = total_numbers ? Number(total_numbers) : null;
 
   // status/flags
   out.active = body.active === false ? false : true;
@@ -57,7 +56,7 @@ async function normalizeBody(body) {
     );
     category_id = rows?.[0]?.id ?? null;
   }
-  out.category_id   = category_id ?? null;
+  out.category_id = category_id ?? null;
   out.category_slug = category_slug || body.category_slug || null;
 
   return out;
@@ -68,7 +67,7 @@ async function normalizeBody(body) {
  * GET /api/admin/infoproducts?search=&page=1&limit=20
  * ========================================= */
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
-  const page  = Math.max(1, parseInt(req.query.page ?? "1", 10) || 1);
+  const page = Math.max(1, parseInt(req.query.page ?? "1", 10) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit ?? "20", 10) || 20));
   const offset = (page - 1) * limit;
   const search = String(req.query.search ?? "").trim().toLowerCase();
@@ -96,7 +95,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     LEFT JOIN categories c ON c.id = p.category_id
     ${where}
     ORDER BY p.updated_at DESC, p.id DESC
-    LIMIT $${params.length-1} OFFSET $${params.length}
+    LIMIT $${params.length - 1} OFFSET $${params.length}
     `,
     params
   );
@@ -105,9 +104,9 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     `
     SELECT COUNT(*)::int AS cnt
     FROM infoproducts p
-    ${where.replace("p.*", "1")} -- reaproveita o mesmo filtro
+    ${search ? "WHERE LOWER(p.sku) LIKE $1 OR LOWER(p.title) LIKE $1 OR LOWER(COALESCE(p.subtitle,'')) LIKE $1 OR LOWER(COALESCE(p.category_slug,'')) LIKE $1" : ""}
     `,
-    search ? [ `%${search}%` ] : []
+    search ? [`%${search}%`] : []
   );
 
   res.json({ items: rows, page, limit, total: tot?.[0]?.cnt ?? rows.length });
@@ -147,7 +146,7 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
       [
         b.sku, b.title, b.subtitle, b.description, b.cover_url, b.file_url, b.file_sha256,
         b.price_cents, b.default_prize_cents, b.default_total_numbers,
-        b.active, b.category_id, b.category_slug
+        b.active, b.category_id, b.category_slug,
       ]
     );
 
@@ -192,7 +191,7 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
         b.sku, b.title, b.subtitle, b.description,
         b.cover_url, b.file_url, b.file_sha256,
         b.price_cents, b.default_prize_cents, b.default_total_numbers,
-        b.active, b.category_id, b.category_slug, id
+        b.active, b.category_id, b.category_slug, id,
       ]
     );
 
@@ -205,7 +204,7 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* =========================================
- * SOFT DELETE (active=false) — recomendável
+ * SOFT DELETE (active=false)
  * DELETE /api/admin/infoproducts/:id
  * ========================================= */
 router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
