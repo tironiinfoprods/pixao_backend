@@ -433,4 +433,53 @@ router.post('/webhook/replay', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/payments/infoproduct
+// body: { infoproduct_id?: number, infoproduct_sku?: string }
+router.post("/infoproduct", async (req, res) => {
+  try {
+    const { infoproduct_id, infoproduct_sku } = req.body || {};
+    if (!infoproduct_id && !infoproduct_sku) {
+      return res.status(400).json({ error: "missing_infoproduct" });
+    }
+
+    // carrega o e-book
+    const col = infoproduct_id ? "id" : "sku";
+    const val = infoproduct_id || String(infoproduct_sku);
+    const { rows } = await query(`
+      SELECT id, price_cents
+      FROM infoproducts
+      WHERE ${infoproduct_id ? "id = $1" : "LOWER(sku)=LOWER($1)"} AND active = true
+      LIMIT 1
+    `, [val]);
+    const p = rows[0];
+    if (!p) return res.status(404).json({ error: "infoproduct_not_found" });
+
+    // cria registro de pagamento "pendente" amarrado ao infoproduto (sem draw/sem números)
+    const paymentId = String(Date.now()); // ou UUID
+    await query(`
+      INSERT INTO payments (id, user_id, draw_id, numbers, amount_cents, status, created_at)
+      VALUES ($1, $2, NULL, '{}'::smallint[], $3, 'pending', NOW())
+    `, [paymentId, req.user?.id || null, p.price_cents]);
+
+    // gere o PIX (reaproveite sua função existente)
+    const pix = await createMercadoPagoPreferenceOrPix({
+      id: paymentId,
+      amount_cents: p.price_cents,
+      description: "Compra de e-book / 1 cota",
+    });
+
+    return res.json({
+      paymentId,
+      amount_cents: p.price_cents,
+      qr_code: pix.qr_code,
+      qr_code_base64: pix.qr_code_base64,
+      copy_paste_code: pix.copy_paste_code,
+    });
+  } catch (e) {
+    console.error("[payments/infoproduct]", e);
+    return res.status(500).json({ error: "create_infoproduct_payment_failed" });
+  }
+});
+
+
 export default router;
