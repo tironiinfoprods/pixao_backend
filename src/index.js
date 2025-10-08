@@ -25,6 +25,9 @@ import adminClientsRouter from "./routes/admin_clients.js";
 import adminWinnersRouter from "./routes/admin_winners.js";
 import adminDashboardRouter from "./routes/admin_dashboard.js";
 
+import vouchersRouter from "./routes/vouchers.js";
+import purchasesRouter from "./routes/purchases.js";
+
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
 import configRouter from "./routes/config.js";
@@ -100,6 +103,9 @@ app.use("/api/draws", drawsRoutes);
 app.use("/api/draws-ext", drawsExtRoutes);
 
 app.use("/api/admin/infoproducts", adminInfoproducts);
+
+app.use("/api/vouchers", vouchersRouter);
+app.use("/api/purchases", purchasesRouter);
 
 // ✅ NOVO: lista/busca infoprodutos (com filtro por categoria via ?category=slug)
 app.use("/api/infoproducts", infoproductsRoutes);
