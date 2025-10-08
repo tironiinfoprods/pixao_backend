@@ -5,9 +5,7 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-/** GET /api/vouchers/remaining?draw_id=123
- * Usa o campo `remaining` do schema atual (soma).
- */
+/** GET /api/vouchers/remaining?draw_id=123 */
 router.get("/remaining", requireAuth, async (req, res) => {
   const drawId = Number(req.query.draw_id);
   if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
@@ -28,19 +26,19 @@ router.get("/remaining", requireAuth, async (req, res) => {
 
 /** POST /api/vouchers/consume
  * body: { draw_id, numbers:[...], reservationId? }
- * - valida se os números ainda estão livres (ignora os que estiverem reservados pelo próprio usuário)
- * - garante saldo (somatório de remaining em vouchers)
- * - grava `numbers` como 'sold'
- * - (opcional) marca a reserva como 'paid'
- * - (opcional) cria um payment sintético (método 'voucher') apenas para histórico/relatórios
- * - decrementa remaining dos vouchers do usuário
+ * - valida conflitos (vendidos e reservados por OUTRO usuário)
+ * - garante saldo em `vouchers`
+ * - marca `numbers` como 'sold' (sem depender de UNIQUE/ON CONFLICT)
+ * - debita vouchers (FIFO)
+ * - marca a reserva como 'paid' (se veio reservationId)
+ * - cria um payment “voucher” simples (apenas histórico)
  */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
   const nums = Array.isArray(req.body?.numbers)
-    ? [...new Set(req.body.numbers.map(n => Number(n)).filter(n => Number.isFinite(n)))]
+    ? [...new Set(req.body.numbers.map(n => Number(n)).filter(Number.isFinite))]
     : [];
-  const reservationId = (req.body?.reservationId || req.body?.reservation_id || null) ?? null;
+  const reservationId = req.body?.reservationId || req.body?.reservation_id || null;
 
   if (!Number.isFinite(drawId) || nums.length === 0) {
     return res.status(400).json({ error: "invalid_payload" });
@@ -49,7 +47,7 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    /* 0) (Opcional) Carrega e valida a reserva do próprio usuário */
+    // (0) Reserva do próprio usuário (se informada)
     let ownedReserved = new Set();
     if (reservationId) {
       const { rows: rrows } = await query(
@@ -76,26 +74,22 @@ router.post("/consume", requireAuth, async (req, res) => {
       }
       const arr = Array.isArray(r.numbers) ? r.numbers.map(Number).filter(Number.isFinite) : [];
       ownedReserved = new Set(nums.filter(n => arr.includes(n)));
-      // se o cliente tentar confirmar nº que não estava na reserva, trataremos como "fora da reserva"
     }
 
-    /* 1) Checa conflitos:
-          - já vendidos/tomados em `numbers`
-          - reservados por OUTRO usuário (em reservations ativas)          */
-    // 1a) vendidos
+    // (1a) Conflitos: vendidos
     const { rows: soldRows } = await query(
       `
       select n
         from numbers
        where draw_id = $1
-         and n = any($2::smallint[])
+         and n = any($2::int[])
          and status in ('sold','taken')
       `,
       [drawId, nums]
     );
     const soldConflicts = new Set(soldRows.map(r => Number(r.n)));
 
-    // 1b) reservados por outros usuários
+    // (1b) Conflitos: reservados por OUTRO usuário (ativos)
     const { rows: otherRes } = await query(
       `
       select numbers
@@ -115,20 +109,20 @@ router.post("/consume", requireAuth, async (req, res) => {
       for (const n of arr) if (nums.includes(n)) reservedByOthers.add(n);
     }
 
-    // 1c) Conflitos finais = vendidos OR reservados por outros OR (quando NÃO tem reserva) status=reserved
+    // (1c) Conflitos adicionais se NÃO houve reservationId (linhas 'reserved' genéricas)
     let additionalReserved = new Set();
     if (!reservationId) {
-      const { rows: resvRows } = await query(
+      const { rows } = await query(
         `
         select n
           from numbers
          where draw_id = $1
-           and n = any($2::smallint[])
+           and n = any($2::int[])
            and status = 'reserved'
         `,
         [drawId, nums]
       );
-      additionalReserved = new Set(resvRows.map(r => Number(r.n)));
+      additionalReserved = new Set(rows.map(r => Number(r.n)));
     }
 
     const conflicts = [...new Set([
@@ -142,7 +136,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "numbers_conflict", conflicts });
     }
 
-    /* 2) Calcula saldo total de vouchers (remaining) e trava linhas */
+    // (2) Vouchers – trava e valida saldo
     const { rows: vrows } = await query(
       `
       select id, remaining
@@ -159,30 +153,34 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    /* 3) Efetiva números como 'sold'
-          - se não existe, cria sold
-          - se existe e está 'available' OU 'reserved' (do próprio), vira 'sold'
-          - qualquer outra situação vira conflito */
+    // (3) Efetiva cada número como 'sold' SEM depender de UNIQUE/ON CONFLICT
+    //     Lock de linha se existir; se não existir, cria
     for (const n of nums) {
-      const up = await query(
-        `
-        insert into numbers (draw_id, n, status)
-        values ($1, $2::smallint, 'sold')
-        on conflict (n, draw_id) do update
-          set status = 'sold'
-          where numbers.status in ('available','reserved')
-        returning n, status
-        `,
+      const { rows: cur } = await query(
+        `select status from numbers where draw_id = $1 and n = $2::int for update`,
         [drawId, n]
       );
-
-      if (!up.rowCount) {
+      if (!cur.length) {
+        // não existe -> cria como sold
+        await query(
+          `insert into numbers (draw_id, n, status) values ($1, $2::int, 'sold')`,
+          [drawId, n]
+        );
+        continue;
+      }
+      const st = String(cur[0].status || "").toLowerCase();
+      if (st === "available" || st === "reserved") {
+        await query(
+          `update numbers set status = 'sold' where draw_id = $1 and n = $2::int`,
+          [drawId, n]
+        );
+      } else {
         await query("rollback");
         return res.status(409).json({ error: "numbers_conflict", conflicts: [n] });
       }
     }
 
-    /* 4) Debita saldo dos vouchers (FIFO) */
+    // (4) Debita vouchers (FIFO)
     let toConsume = nums.length;
     for (const v of vrows) {
       if (toConsume <= 0) break;
@@ -200,21 +198,16 @@ router.post("/consume", requireAuth, async (req, res) => {
       toConsume -= take;
     }
 
-    /* 4b) (Opcional) Marca a reserva como paga, se informada */
+    // (4b) Marca reserva como paga (se houver)
     if (reservationId) {
       await query(
-        `update reservations
-            set status = 'paid',
-                paid_at = now()
-          where id = $1`,
+        `update reservations set status = 'paid', paid_at = now() where id = $1`,
         [reservationId]
       );
     }
 
-    /* 4c) (Opcional) Cria um registro em payments para histórico
-          -> se falhar por schema diferente, apenas loga e segue */
+    // (4c) Cria registro simples em payments (histórico). NÃO falha a operação se der erro.
     try {
-      // tenta obter preço do sorteio (se existir)
       const { rows: priceRow } = await query(
         `select coalesce(price_cents, amount_cents, price, 0)::int as price_cents
            from draws
@@ -223,34 +216,16 @@ router.post("/consume", requireAuth, async (req, res) => {
       );
       const unitCents = Number(priceRow?.[0]?.price_cents || 0);
       const totalCents = unitCents * nums.length;
-      const payId = "vch_" + Date.now().toString() + "_" + Math.floor(Math.random() * 1e6);
 
-      // tentativa 1: schema mais completo
       await query(
         `
-        insert into payments
-          (id, user_id, draw_id, numbers, amount_cents, status, method, created_at, paid_at)
-        values
-          ($1, $2, $3, $4::smallint[], $5, 'paid', 'voucher', now(), now())
+        insert into payments (user_id, draw_id, numbers, amount_cents)
+        values ($1, $2, $3::int[], $4)
         `,
-        [payId, req.user.id, drawId, nums, totalCents]
+        [req.user.id, drawId, nums, totalCents]
       );
-    } catch (e1) {
-      try {
-        // tentativa 2: columns básicas
-        await query(
-          `
-          insert into payments
-            (user_id, draw_id, numbers, amount_cents)
-          values
-            ($1, $2, $3::smallint[], 0)
-          `,
-          [req.user.id, drawId, nums]
-        );
-      } catch (e2) {
-        // apenas loga; não deve invalidar a compra
-        console.warn("[vouchers/consume] payments insert skipped:", e1?.message || e1, e2?.message || e2);
-      }
+    } catch (e) {
+      console.warn("[vouchers/consume] payments insert skipped:", e?.message || e);
     }
 
     await query("commit");
