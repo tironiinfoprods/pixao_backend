@@ -5,7 +5,9 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-/** GET /api/vouchers/remaining?draw_id=123  (sem alteração) */
+/** GET /api/vouchers/remaining?draw_id=123
+ * Usa o campo `remaining` do schema atual (soma).
+ */
 router.get("/remaining", requireAuth, async (req, res) => {
   const drawId = Number(req.query.draw_id);
   if (!Number.isFinite(drawId)) return res.status(400).json({ error: "invalid_draw_id" });
@@ -24,11 +26,17 @@ router.get("/remaining", requireAuth, async (req, res) => {
   }
 });
 
-/** POST /api/vouchers/consume  { draw_id, numbers:[...] } */
+/** POST /api/vouchers/consume
+ * body: { draw_id, numbers:[...] }
+ * - valida se os números ainda estão livres
+ * - garante saldo (somatório de remaining)
+ * - grava `numbers` como 'sold'
+ * - decrementa remaining dos vouchers do usuário
+ */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
   const nums = Array.isArray(req.body?.numbers)
-    ? [...new Set(req.body.numbers.map((n) => Number(n)).filter(Number.isFinite))]
+    ? [...new Set(req.body.numbers.map(n => Number(n)).filter(n => Number.isFinite(n)))]
     : [];
 
   if (!Number.isFinite(drawId) || nums.length === 0) {
@@ -38,7 +46,23 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    // 1) Garante saldo total de vouchers (somando remaining)
+    // 1) Checa conflitos de números já tomados
+    const { rows: taken } = await query(
+      `
+      select n
+        from numbers
+       where draw_id = $1
+         and n = any($2::smallint[])
+         and status <> 'available'
+      `,
+      [drawId, nums]
+    );
+    if (taken.length) {
+      await query("rollback");
+      return res.status(409).json({ error: "numbers_conflict", conflicts: taken.map(r => r.n) });
+    }
+
+    // 2) Calcula saldo total de vouchers (remaining)
     const { rows: vrows } = await query(
       `
       select id, remaining
@@ -55,38 +79,40 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    // 2) Tenta vender em LOTE: só atualiza quem ainda está 'available'
-    const { rows: soldRows } = await query(
-      `
-      update numbers
-         set status = 'sold'
-       where draw_id = $1
-         and n = any($2::smallint[])
-         and status = 'available'
-       returning n
-      `,
-      [drawId, nums]
-    );
+    // 3) Efetiva números como 'sold'
+    //    >>> CORREÇÃO: upsert condicional. Se já existe 'available', vira 'sold';
+    //    se não existe, cria; se já não estiver 'available', não atualiza (rowCount=0 => conflito).
+    for (const n of nums) {
+      const up = await query(
+        `
+        insert into numbers (draw_id, n, status)
+        values ($1, $2::smallint, 'sold')
+        on conflict (n, draw_id) do update
+          set status = 'sold'
+          where numbers.status = 'available'
+        returning n
+        `,
+        [drawId, n]
+      );
 
-    // 3) Se nem todos foram atualizados, há conflitos (já vendidos/reservados)
-    const soldSet = new Set(soldRows.map(r => Number(r.n)));
-    const conflicts = nums.filter(n => !soldSet.has(n));
-    if (conflicts.length) {
-      await query("rollback");
-      return res.status(409).json({ error: "numbers_conflict", conflicts });
+      if (!up.rowCount) {
+        // alguém tomou no meio do caminho ou status não era 'available'
+        await query("rollback");
+        return res.status(409).json({ error: "numbers_conflict", conflicts: [n] });
+      }
     }
 
     // 4) Debita saldo dos vouchers (FIFO)
     let toConsume = nums.length;
     for (const v of vrows) {
       if (toConsume <= 0) break;
-      const take = Math.min(Number(v.remaining), toConsume);
+      const take = Math.min(v.remaining, toConsume);
       await query(
         `
         update vouchers
            set remaining = remaining - $1,
                consumed_at = case when remaining - $1 = 0 then now() else consumed_at end,
-               used        = case when remaining - $1 = 0 then true    else used        end
+               used = case when remaining - $1 = 0 then true else used end
          where id = $2
         `,
         [take, v.id]
