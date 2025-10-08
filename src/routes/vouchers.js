@@ -5,13 +5,14 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-/** GET /api/vouchers/remaining?draw_id=123 */
+/** GET /api/vouchers/remaining?draw_id=123
+ * Retorna a soma de `remaining` dos vouchers do usuário p/ o sorteio.
+ */
 router.get("/remaining", requireAuth, async (req, res) => {
   const drawId = Number(req.query.draw_id);
   if (!Number.isFinite(drawId)) {
     return res.status(400).json({ error: "invalid_draw_id" });
   }
-
   try {
     const { rows } = await query(
       `select coalesce(sum(remaining),0)::int as remaining
@@ -27,19 +28,19 @@ router.get("/remaining", requireAuth, async (req, res) => {
 });
 
 /** POST /api/vouchers/consume
- * body: { draw_id, numbers:[...], reservationId? | reservation_id?, user_id? }
- * - valida disponibilidade (conflito somente com 'sold'/'taken')
- * - debita vouchers do usuário
- * - efetiva números como 'sold'
- * - marca a reservation informada como 'paid' (se existir)
- * - tenta registrar um pagamento (best-effort, fora da transação)
+ * body: { draw_id, numbers:[...], reservation_id? }
+ * - valida números livres
+ * - efetiva números como "taken" (indisponíveis)
+ * - debita vouchers do usuário (FIFO)
+ * - marca a reserva como "paid" (se enviada)
+ * - cria um registro em `payments` (method = 'voucher', amount_cents = 0)
  */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
   const nums = Array.isArray(req.body?.numbers)
     ? [...new Set(req.body.numbers.map(n => Number(n)).filter(Number.isFinite))]
     : [];
-  const reservationId = req.body?.reservationId || req.body?.reservation_id || null;
+  const reservationId = req.body?.reservation_id || req.body?.reservationId || null;
 
   if (!Number.isFinite(drawId) || nums.length === 0) {
     return res.status(400).json({ error: "invalid_payload" });
@@ -48,14 +49,14 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    // 1) Conflitos: só considera vendidos/tomados
+    // 1) Conflitos: já reservados/tomados?
     const { rows: taken } = await query(
       `
       select n
         from numbers
        where draw_id = $1
          and n = any($2::smallint[])
-         and status in ('sold','taken')
+         and status <> 'available'
       `,
       [drawId, nums]
     );
@@ -64,12 +65,14 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "numbers_conflict", conflicts: taken.map(r => r.n) });
     }
 
-    // 2) Saldo de vouchers (lock FIFO)
+    // 2) Saldo de vouchers (total remaining)
     const { rows: vrows } = await query(
       `
       select id, remaining
         from vouchers
-       where user_id = $1 and draw_id = $2 and remaining > 0
+       where user_id = $1
+         and draw_id = $2
+         and remaining > 0
        order by created_at asc
        for update skip locked
       `,
@@ -81,15 +84,16 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    // 3) Efetiva números como 'sold' (permite atualizar de 'available' ou 'reserved' para 'sold')
+    // 3) Efetiva números como "taken" (indisponíveis)
+    //    Requer índice único em (draw_id, n).
     for (const n of nums) {
       const up = await query(
         `
         insert into numbers (draw_id, n, status)
-        values ($1, $2::smallint, 'sold')
-        on conflict (n, draw_id) do update
-          set status = 'sold'
-          where numbers.status in ('available','reserved')
+        values ($1, $2::smallint, 'taken')
+        on conflict (draw_id, n) do update
+          set status = 'taken'
+          where numbers.status = 'available'
         returning n
         `,
         [drawId, n]
@@ -100,7 +104,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       }
     }
 
-    // 4) Debita vouchers (FIFO)
+    // 4) Debita saldo dos vouchers (FIFO)
     let toConsume = nums.length;
     for (const v of vrows) {
       if (toConsume <= 0) break;
@@ -118,80 +122,48 @@ router.post("/consume", requireAuth, async (req, res) => {
       toConsume -= take;
     }
 
-    // 5) Se veio reservationId, marca como 'paid' e mescla números
-    let savedReservationId = null;
+    // 5) Marca reserva como "paid" (se enviada)
     if (reservationId) {
-      const { rows: rrows } = await query(
+      await query(
         `
         update reservations
-           set status  = 'paid',
-               numbers = (
-                 select array_agg(distinct x)::int2[]
-                   from unnest(coalesce(reservations.numbers,'{}')::int2[] || $4::int2[]) as x
-               )
-         where id = $1 and user_id = $2 and draw_id = $3
-         returning id
+           set status = 'paid',
+               updated_at = now()
+         where id = $1
+           and user_id = $2
         `,
-        [reservationId, req.user.id, drawId, nums]
+        [reservationId, req.user.id]
       );
-      savedReservationId = rrows?.[0]?.id || null;
+    }
+
+    // 6) Registra pagamento "voucher" (valor 0)
+    let paymentId = null;
+    try {
+      const ins = await query(
+        `
+        insert into payments (user_id, draw_id, numbers, status, method, amount_cents, created_at, updated_at)
+        values ($1, $2, $3::int[], 'paid', 'voucher', 0, now(), now())
+        returning id
+        `,
+        [req.user.id, drawId, nums]
+      );
+      paymentId = ins?.rows?.[0]?.id ?? null;
+    } catch (e) {
+      // Se a tabela/coluna não existir, não quebra a transação principal.
+      console.warn("[vouchers/consume] payments insert skipped:", e?.message || e);
     }
 
     await query("commit");
-
-    // 6) Registro de pagamento (best-effort, fora da transação)
-    //    Tenta um insert básico; se falhar por esquema diferente, apenas loga e segue.
-    let paymentId = null;
-    try {
-      // Descobre colunas existentes para montar o INSERT mais seguro possível
-      const { rows: cols } = await query(
-        `select column_name
-           from information_schema.columns
-          where table_schema = 'public' and table_name = 'payments'`
-      );
-      const names = new Set(cols.map(c => c.column_name));
-
-      // Monta dinamicamente
-      const fields = [];
-      const values = [];
-      const params = [];
-      let p = 1;
-
-      if (names.has("user_id")) { fields.push("user_id"); params.push(req.user.id); values.push(`$${p++}`); }
-      if (names.has("draw_id")) { fields.push("draw_id"); params.push(drawId); values.push(`$${p++}`); }
-      if (names.has("numbers")) { fields.push("numbers"); params.push(nums); values.push(`$${p++}::int2[]`); }
-      if (names.has("status"))  { fields.push("status");  params.push("paid"); values.push(`$${p++}`); }
-      if (names.has("amount_cents")) {
-        // valor simbólico (0) — estamos consumindo por voucher
-        fields.push("amount_cents"); params.push(0); values.push(`$${p++}`);
-      }
-      if (names.has("reservation_id") && savedReservationId) {
-        fields.push("reservation_id"); params.push(savedReservationId); values.push(`$${p++}::uuid`);
-      }
-
-      if (fields.length >= 3) { // precisa de algo minimamente útil
-        const sql = `
-          insert into payments (${fields.join(",")})
-          values (${values.join(",")})
-          returning id
-        `;
-        const ins = await query(sql, params);
-        paymentId = ins?.rows?.[0]?.id || null;
-      }
-    } catch (e) {
-      console.warn("[vouchers/consume] payment insert skipped:", e?.message || e);
-    }
-
-    return res.json({
+    res.json({
       ok: true,
       consumed: nums.length,
-      reservation_id: savedReservationId || null,
-      payment_id: paymentId || null,
+      reservation_id: reservationId || null,
+      payment_id: paymentId,
     });
   } catch (e) {
-    await query("rollback").catch(() => {});
+    await query("rollback");
     console.error("[vouchers/consume] fail:", e);
-    return res.status(500).json({ error: "consume_failed" });
+    res.status(500).json({ error: "consume_failed" });
   }
 });
 
