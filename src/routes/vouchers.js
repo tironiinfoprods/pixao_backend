@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { query } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { v4 as uuidv4 } from "uuid";
 
 const router = Router();
 
@@ -28,22 +29,19 @@ router.get("/remaining", requireAuth, async (req, res) => {
 
 /**
  * POST /api/vouchers/consume
- * body: { draw_id, numbers:[...], reservationId? | reservation_id?, user_id? }
+ * body: { draw_id, numbers:[...], reservationId? | reservation_id? }
  *
  * Fluxo:
- * - valida payload
- * - checa conflito:
- *     • numbers.status IN ('sold','taken')
- *     • reservas ATIVAS de OUTROS usuários contendo esses números
- * - debita vouchers (FIFO, for update skip locked)
- * - confirma números como 'sold' (de 'available' ou 'reserved')
- * - se houver reservationId, marca como 'paid' e mescla números
- * - registra pagamento (best-effort) fora da transação
+ * - checa conflito com numbers ('sold','taken') e reservas ativas de OUTROS usuários
+ * - debita vouchers (FIFO)
+ * - confirma números como 'sold'
+ * - se houver reservationId, marca como 'paid'
+ * - cria um registro em `payments` com status **Approved** (id próprio)
  */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
   const nums = Array.isArray(req.body?.numbers)
-    ? [...new Set(req.body.numbers.map(n => Number(n)).filter(Number.isFinite))]
+    ? [...new Set(req.body.numbers.map((n) => Number(n)).filter(Number.isFinite))]
     : [];
   const reservationId = req.body?.reservationId || req.body?.reservation_id || null;
 
@@ -54,7 +52,7 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    // --- 1) Conflitos em numbers: já vendidos/tomados
+    // 1) Conflitos em numbers: já vendidos/tomados
     const { rows: takenRows } = await query(
       `
       select n
@@ -65,15 +63,12 @@ router.post("/consume", requireAuth, async (req, res) => {
       `,
       [drawId, nums]
     );
-    const conflictsFromNumbers = takenRows.map(r => Number(r.n));
+    const conflictsFromNumbers = takenRows.map((r) => Number(r.n));
 
-    // --- 2) Conflitos por reservas ATIVAS de OUTROS usuários
-    // status considerados "ativos": active, reserved, pending, await/aguard*
+    // 2) Conflitos: reservas de OUTROS usuários ainda ativas
     const { rows: rconf } = await query(
       `
-      with wanted(n) as (
-        select unnest($3::int2[])
-      )
+      with wanted(n) as ( select unnest($3::int2[]) )
       select distinct w.n
         from reservations r
         join wanted w on w.n = any(coalesce(r.numbers,'{}')::int2[])
@@ -89,7 +84,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       `,
       [drawId, req.user.id, nums]
     );
-    const conflictsFromOthers = rconf.map(r => Number(r.n));
+    const conflictsFromOthers = rconf.map((r) => Number(r.n));
 
     const conflicts = [...new Set([...conflictsFromNumbers, ...conflictsFromOthers])];
     if (conflicts.length) {
@@ -97,7 +92,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "unavailable", conflicts });
     }
 
-    // --- 3) Saldo de vouchers (lock FIFO)
+    // 3) Saldo de vouchers (FIFO + lock)
     const { rows: vrows } = await query(
       `
       select id, remaining
@@ -114,8 +109,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    // --- 4) Efetiva números como 'sold'
-    // Permite atualizar de 'available' ou 'reserved' -> 'sold'
+    // 4) Confirma números como 'sold'
     for (const n of nums) {
       const up = await query(
         `
@@ -128,15 +122,13 @@ router.post("/consume", requireAuth, async (req, res) => {
         `,
         [drawId, n]
       );
-
-      // Se não atualizou, alguém pegou no meio do caminho (corrida)
       if (!up.rowCount) {
         await query("rollback");
         return res.status(409).json({ error: "numbers_conflict", conflicts: [n] });
       }
     }
 
-    // --- 5) Debita vouchers (FIFO)
+    // 5) Debita vouchers (FIFO)
     let toConsume = nums.length;
     for (const v of vrows) {
       if (toConsume <= 0) break;
@@ -154,7 +146,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       toConsume -= take;
     }
 
-    // --- 6) Se houver reservationId: marca como paid e mescla números
+    // 6) Se houver reservationId, marca como 'paid' e mescla números
     let savedReservationId = null;
     if (reservationId) {
       const { rows: rrows } = await query(
@@ -173,46 +165,98 @@ router.post("/consume", requireAuth, async (req, res) => {
       savedReservationId = rrows?.[0]?.id || null;
     }
 
-    await query("commit");
-
-    // --- 7) Registro de pagamento (best-effort, fora da transação)
+    // 7) Cria registro em payments com status "Approved" (id próprio)
     let paymentId = null;
     try {
+      // Lê colunas existentes para montar INSERT compatível
       const { rows: cols } = await query(
-        `select column_name
-           from information_schema.columns
+        `select column_name from information_schema.columns
           where table_schema = 'public' and table_name = 'payments'`
       );
-      const names = new Set(cols.map(c => c.column_name));
+      const names = new Set(cols.map((c) => c.column_name));
 
-      const fields = [];
-      const values = [];
-      const params = [];
-      let p = 1;
+      // Sempre forneça um ID (sua tabela não tem default)
+      paymentId = `vch_${uuidv4().replace(/-/g, "")}`;
 
-      if (names.has("user_id")) { fields.push("user_id"); params.push(req.user.id); values.push(`$${p++}`); }
-      if (names.has("draw_id")) { fields.push("draw_id"); params.push(drawId); values.push(`$${p++}`); }
-      if (names.has("numbers")) { fields.push("numbers"); params.push(nums); values.push(`$${p++}::int2[]`); }
-      if (names.has("status"))  { fields.push("status");  params.push("paid"); values.push(`$${p++}`); }
-      if (names.has("amount_cents")) { fields.push("amount_cents"); params.push(0); values.push(`$${p++}`); }
+      const fields = ["id"];
+      const values = ["$1"];
+      const params = [paymentId];
+      let p = 2;
+
+      if (names.has("user_id")) {
+        fields.push("user_id");
+        values.push(`$${p}`);
+        params.push(req.user.id);
+        p++;
+      }
+      if (names.has("draw_id")) {
+        fields.push("draw_id");
+        values.push(`$${p}`);
+        params.push(drawId);
+        p++;
+      }
+      if (names.has("numbers")) {
+        fields.push("numbers");
+        values.push(`$${p}::int2[]`);
+        params.push(nums);
+        p++;
+      }
+      if (names.has("amount_cents")) {
+        fields.push("amount_cents");
+        values.push(`$${p}`);
+        params.push(0);
+        p++;
+      }
+      if (names.has("status")) {
+        fields.push("status");
+        values.push(`$${p}`);
+        params.push("Approved"); // <- como solicitado
+        p++;
+      }
+      if (names.has("method")) {
+        fields.push("method");
+        values.push(`$${p}`);
+        params.push("voucher");
+        p++;
+      }
+      if (names.has("paid_at")) {
+        fields.push("paid_at");
+        values.push("NOW()");
+      }
+      if (names.has("created_at")) {
+        fields.push("created_at");
+        values.push("NOW()");
+      }
       if (names.has("reservation_id") && savedReservationId) {
-        fields.push("reservation_id"); params.push(savedReservationId); values.push(`$${p++}::uuid`);
+        fields.push("reservation_id");
+        values.push(`$${p}::uuid`);
+        params.push(savedReservationId);
+        p++;
       }
 
-      if (fields.length >= 3) {
-        const sql = `insert into payments (${fields.join(",")}) values (${values.join(",")}) returning id`;
-        const ins = await query(sql, params);
-        paymentId = ins?.rows?.[0]?.id || null;
+      // fallback mínimo caso o schema seja muito diferente
+      if (fields.length < 3) {
+        // id + status já temos; tenta pelo menos (id, status)
+        await query(
+          `insert into payments (id, status) values ($1, 'Approved')`,
+          [paymentId]
+        );
+      } else {
+        const sql = `insert into payments (${fields.join(",")}) values (${values.join(",")})`;
+        await query(sql, params);
       }
     } catch (e) {
       console.warn("[vouchers/consume] payment insert skipped:", e?.message || e);
+      paymentId = null; // não bloqueia a compra
     }
+
+    await query("commit");
 
     return res.json({
       ok: true,
       consumed: nums.length,
       reservation_id: savedReservationId || null,
-      payment_id: paymentId || null,
+      payment_id: paymentId,
     });
   } catch (e) {
     await query("rollback").catch(() => {});
