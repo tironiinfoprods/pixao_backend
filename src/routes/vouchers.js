@@ -26,13 +26,19 @@ router.get("/remaining", requireAuth, async (req, res) => {
   }
 });
 
-/** POST /api/vouchers/consume
+/**
+ * POST /api/vouchers/consume
  * body: { draw_id, numbers:[...], reservationId? | reservation_id?, user_id? }
- * - valida disponibilidade (conflito somente com 'sold'/'taken')
- * - debita vouchers do usuário
- * - efetiva números como 'sold'
- * - marca a reservation informada como 'paid' (se existir)
- * - tenta registrar um pagamento (best-effort, fora da transação)
+ *
+ * Fluxo:
+ * - valida payload
+ * - checa conflito:
+ *     • numbers.status IN ('sold','taken')
+ *     • reservas ATIVAS de OUTROS usuários contendo esses números
+ * - debita vouchers (FIFO, for update skip locked)
+ * - confirma números como 'sold' (de 'available' ou 'reserved')
+ * - se houver reservationId, marca como 'paid' e mescla números
+ * - registra pagamento (best-effort) fora da transação
  */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
@@ -48,8 +54,8 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    // 1) Conflitos: só considera vendidos/tomados
-    const { rows: taken } = await query(
+    // --- 1) Conflitos em numbers: já vendidos/tomados
+    const { rows: takenRows } = await query(
       `
       select n
         from numbers
@@ -59,12 +65,39 @@ router.post("/consume", requireAuth, async (req, res) => {
       `,
       [drawId, nums]
     );
-    if (taken.length) {
+    const conflictsFromNumbers = takenRows.map(r => Number(r.n));
+
+    // --- 2) Conflitos por reservas ATIVAS de OUTROS usuários
+    // status considerados "ativos": active, reserved, pending, await/aguard*
+    const { rows: rconf } = await query(
+      `
+      with wanted(n) as (
+        select unnest($3::int2[])
+      )
+      select distinct w.n
+        from reservations r
+        join wanted w on w.n = any(coalesce(r.numbers,'{}')::int2[])
+       where r.draw_id = $1
+         and r.user_id <> $2
+         and (
+              lower(coalesce(r.status,'')) = 'active'
+           or lower(coalesce(r.status,'')) = 'reserved'
+           or lower(coalesce(r.status,'')) = 'pending'
+           or lower(coalesce(r.status,'')) like 'await%'
+           or lower(coalesce(r.status,'')) like 'aguard%'
+         )
+      `,
+      [drawId, req.user.id, nums]
+    );
+    const conflictsFromOthers = rconf.map(r => Number(r.n));
+
+    const conflicts = [...new Set([...conflictsFromNumbers, ...conflictsFromOthers])];
+    if (conflicts.length) {
       await query("rollback");
-      return res.status(409).json({ error: "numbers_conflict", conflicts: taken.map(r => r.n) });
+      return res.status(409).json({ error: "unavailable", conflicts });
     }
 
-    // 2) Saldo de vouchers (lock FIFO)
+    // --- 3) Saldo de vouchers (lock FIFO)
     const { rows: vrows } = await query(
       `
       select id, remaining
@@ -81,7 +114,8 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    // 3) Efetiva números como 'sold' (permite atualizar de 'available' ou 'reserved' para 'sold')
+    // --- 4) Efetiva números como 'sold'
+    // Permite atualizar de 'available' ou 'reserved' -> 'sold'
     for (const n of nums) {
       const up = await query(
         `
@@ -94,13 +128,15 @@ router.post("/consume", requireAuth, async (req, res) => {
         `,
         [drawId, n]
       );
+
+      // Se não atualizou, alguém pegou no meio do caminho (corrida)
       if (!up.rowCount) {
         await query("rollback");
         return res.status(409).json({ error: "numbers_conflict", conflicts: [n] });
       }
     }
 
-    // 4) Debita vouchers (FIFO)
+    // --- 5) Debita vouchers (FIFO)
     let toConsume = nums.length;
     for (const v of vrows) {
       if (toConsume <= 0) break;
@@ -118,7 +154,7 @@ router.post("/consume", requireAuth, async (req, res) => {
       toConsume -= take;
     }
 
-    // 5) Se veio reservationId, marca como 'paid' e mescla números
+    // --- 6) Se houver reservationId: marca como paid e mescla números
     let savedReservationId = null;
     if (reservationId) {
       const { rows: rrows } = await query(
@@ -139,11 +175,9 @@ router.post("/consume", requireAuth, async (req, res) => {
 
     await query("commit");
 
-    // 6) Registro de pagamento (best-effort, fora da transação)
-    //    Tenta um insert básico; se falhar por esquema diferente, apenas loga e segue.
+    // --- 7) Registro de pagamento (best-effort, fora da transação)
     let paymentId = null;
     try {
-      // Descobre colunas existentes para montar o INSERT mais seguro possível
       const { rows: cols } = await query(
         `select column_name
            from information_schema.columns
@@ -151,7 +185,6 @@ router.post("/consume", requireAuth, async (req, res) => {
       );
       const names = new Set(cols.map(c => c.column_name));
 
-      // Monta dinamicamente
       const fields = [];
       const values = [];
       const params = [];
@@ -161,20 +194,13 @@ router.post("/consume", requireAuth, async (req, res) => {
       if (names.has("draw_id")) { fields.push("draw_id"); params.push(drawId); values.push(`$${p++}`); }
       if (names.has("numbers")) { fields.push("numbers"); params.push(nums); values.push(`$${p++}::int2[]`); }
       if (names.has("status"))  { fields.push("status");  params.push("paid"); values.push(`$${p++}`); }
-      if (names.has("amount_cents")) {
-        // valor simbólico (0) — estamos consumindo por voucher
-        fields.push("amount_cents"); params.push(0); values.push(`$${p++}`);
-      }
+      if (names.has("amount_cents")) { fields.push("amount_cents"); params.push(0); values.push(`$${p++}`); }
       if (names.has("reservation_id") && savedReservationId) {
         fields.push("reservation_id"); params.push(savedReservationId); values.push(`$${p++}::uuid`);
       }
 
-      if (fields.length >= 3) { // precisa de algo minimamente útil
-        const sql = `
-          insert into payments (${fields.join(",")})
-          values (${values.join(",")})
-          returning id
-        `;
+      if (fields.length >= 3) {
+        const sql = `insert into payments (${fields.join(",")}) values (${values.join(",")}) returning id`;
         const ins = await query(sql, params);
         paymentId = ins?.rows?.[0]?.id || null;
       }
