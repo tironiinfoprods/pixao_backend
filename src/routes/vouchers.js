@@ -27,13 +27,12 @@ router.get("/remaining", requireAuth, async (req, res) => {
 });
 
 /** POST /api/vouchers/consume
- * body: { draw_id, numbers:[...], reservationId? | reservation_id? }
- * Regras:
- * - conflito se: já estiver 'sold'/'taken' OU 'reserved' por OUTRO usuário
- * - permite virar 'sold' se estiver 'available' ou 'reserved' PELO MESMO usuário (e opcionalmente pela mesma reserva)
- * - debita vouchers do usuário (FIFO)
- * - marca a reservation enviada como 'paid'
- * - tenta registrar pagamento (best-effort)
+ * body: { draw_id, numbers:[...], reservationId? | reservation_id?, user_id? }
+ * - valida disponibilidade (conflito somente com 'sold'/'taken')
+ * - debita vouchers do usuário
+ * - efetiva números como 'sold'
+ * - marca a reservation informada como 'paid' (se existir)
+ * - tenta registrar um pagamento (best-effort, fora da transação)
  */
 router.post("/consume", requireAuth, async (req, res) => {
   const drawId = Number(req.body?.draw_id);
@@ -49,45 +48,20 @@ router.post("/consume", requireAuth, async (req, res) => {
   try {
     await query("begin");
 
-    // 1) Conflitos:
-    //    - vendidos/tomados
-    //    - reservados por OUTRO usuário (permitimos reservado pelo próprio usuário)
-    const { rows: conflicts } = await query(
+    // 1) Conflitos: só considera vendidos/tomados
+    const { rows: taken } = await query(
       `
-      with input(n) as (select unnest($2::smallint[]))
-      select i.n
-        from input i
-       where exists (
-              select 1
-                from numbers num
-               where num.draw_id = $1
-                 and num.n = i.n
-                 and num.status in ('sold','taken')
-            )
-          or exists (
-              select 1
-                from numbers num
-               where num.draw_id = $1
-                 and num.n = i.n
-                 and num.status = 'reserved'
-                 and not exists (
-                       select 1
-                         from reservations r
-                        where r.draw_id = $1
-                          and r.user_id = $3
-                          and r.status in ('active','pending','reserved')
-                          and i.n = any(r.numbers)
-                     )
-            )
+      select n
+        from numbers
+       where draw_id = $1
+         and n = any($2::smallint[])
+         and status in ('sold','taken')
       `,
-      [drawId, nums, req.user.id]
+      [drawId, nums]
     );
-
-    if (conflicts.length) {
+    if (taken.length) {
       await query("rollback");
-      return res
-        .status(409)
-        .json({ error: "numbers_conflict", conflicts: conflicts.map(r => r.n) });
+      return res.status(409).json({ error: "numbers_conflict", conflicts: taken.map(r => r.n) });
     }
 
     // 2) Saldo de vouchers (lock FIFO)
@@ -107,35 +81,19 @@ router.post("/consume", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "not_enough_vouchers" });
     }
 
-    // 3) Efetiva números como 'sold'
-    //    - insere se não existir
-    //    - atualiza se 'available'
-    //    - atualiza se 'reserved' pelo MESMO usuário (e opcionalmente pela mesma reserva)
+    // 3) Efetiva números como 'sold' (permite atualizar de 'available' ou 'reserved' para 'sold')
     for (const n of nums) {
       const up = await query(
         `
         insert into numbers (draw_id, n, status)
         values ($1, $2::smallint, 'sold')
-        on conflict (draw_id, n) do update
+        on conflict (n, draw_id) do update
           set status = 'sold'
-          where numbers.status = 'available'
-             or (
-                  numbers.status = 'reserved'
-              and exists (
-                    select 1
-                      from reservations r
-                     where r.draw_id = $1
-                       and r.user_id = $3
-                       and ($4::uuid is null or r.id = $4::uuid)
-                       and r.status in ('active','pending','reserved')
-                       and numbers.n = any(r.numbers)
-                  )
-             )
+          where numbers.status in ('available','reserved')
         returning n
         `,
-        [drawId, n, req.user.id, reservationId]
+        [drawId, n]
       );
-
       if (!up.rowCount) {
         await query("rollback");
         return res.status(409).json({ error: "numbers_conflict", conflicts: [n] });
@@ -170,8 +128,7 @@ router.post("/consume", requireAuth, async (req, res) => {
                numbers = (
                  select array_agg(distinct x)::int2[]
                    from unnest(coalesce(reservations.numbers,'{}')::int2[] || $4::int2[]) as x
-               ),
-               updated_at = now()
+               )
          where id = $1 and user_id = $2 and draw_id = $3
          returning id
         `,
@@ -182,30 +139,42 @@ router.post("/consume", requireAuth, async (req, res) => {
 
     await query("commit");
 
-    // 6) Pagamento best-effort (fora da transação)
+    // 6) Registro de pagamento (best-effort, fora da transação)
+    //    Tenta um insert básico; se falhar por esquema diferente, apenas loga e segue.
     let paymentId = null;
     try {
+      // Descobre colunas existentes para montar o INSERT mais seguro possível
       const { rows: cols } = await query(
         `select column_name
            from information_schema.columns
-          where table_schema='public' and table_name='payments'`
+          where table_schema = 'public' and table_name = 'payments'`
       );
-      const have = new Set(cols.map(c => c.column_name));
-      const fields = [], values = [], params = [];
+      const names = new Set(cols.map(c => c.column_name));
+
+      // Monta dinamicamente
+      const fields = [];
+      const values = [];
+      const params = [];
       let p = 1;
 
-      if (have.has("user_id")) { fields.push("user_id"); params.push(req.user.id); values.push(`$${p++}`); }
-      if (have.has("draw_id")) { fields.push("draw_id"); params.push(drawId); values.push(`$${p++}`); }
-      if (have.has("numbers")) { fields.push("numbers"); params.push(nums); values.push(`$${p++}::int2[]`); }
-      if (have.has("status"))  { fields.push("status");  params.push("paid"); values.push(`$${p++}`); }
-      if (have.has("amount_cents")) { fields.push("amount_cents"); params.push(0); values.push(`$${p++}`); }
-      if (have.has("method")) { fields.push("method"); params.push("voucher"); values.push(`$${p++}`); }
-      if (have.has("reservation_id") && savedReservationId) {
+      if (names.has("user_id")) { fields.push("user_id"); params.push(req.user.id); values.push(`$${p++}`); }
+      if (names.has("draw_id")) { fields.push("draw_id"); params.push(drawId); values.push(`$${p++}`); }
+      if (names.has("numbers")) { fields.push("numbers"); params.push(nums); values.push(`$${p++}::int2[]`); }
+      if (names.has("status"))  { fields.push("status");  params.push("paid"); values.push(`$${p++}`); }
+      if (names.has("amount_cents")) {
+        // valor simbólico (0) — estamos consumindo por voucher
+        fields.push("amount_cents"); params.push(0); values.push(`$${p++}`);
+      }
+      if (names.has("reservation_id") && savedReservationId) {
         fields.push("reservation_id"); params.push(savedReservationId); values.push(`$${p++}::uuid`);
       }
 
-      if (fields.length >= 3) {
-        const sql = `insert into payments (${fields.join(",")}) values (${values.join(",")}) returning id`;
+      if (fields.length >= 3) { // precisa de algo minimamente útil
+        const sql = `
+          insert into payments (${fields.join(",")})
+          values (${values.join(",")})
+          returning id
+        `;
         const ins = await query(sql, params);
         paymentId = ins?.rows?.[0]?.id || null;
       }
