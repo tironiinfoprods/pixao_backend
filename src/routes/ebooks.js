@@ -5,6 +5,7 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { query } from '../db.js';
 
+
 const router = express.Router();
 
 router.get('/:sku/download', requireAuth, async (req, res) => {

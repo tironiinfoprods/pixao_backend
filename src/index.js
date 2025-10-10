@@ -28,6 +28,8 @@ import adminDashboardRouter from "./routes/admin_dashboard.js";
 import vouchersRouter from "./routes/vouchers.js";
 import purchasesRouter from "./routes/purchases.js";
 
+import ebooksRouter from './routes/ebooks.js';
+
 // ✅ Config pública (GET/POST completo) e admin
 //    ATENÇÃO: usamos APENAS ESTE router para /api/config para evitar duplicidade.
 import configRouter from "./routes/config.js";
@@ -115,6 +117,10 @@ app.use("/api/admin/draws", adminDrawsRouter);
 app.use("/api/admin/clients", adminClientsRouter);
 app.use("/api/admin/winners", adminWinnersRouter);
 app.use("/api/admin/dashboard", adminDashboardRouter);
+
+app.use('/api/ebooks', ebooksRouter);
+
+
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
