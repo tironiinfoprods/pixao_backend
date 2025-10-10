@@ -246,7 +246,7 @@ async function sendResetMailBrevo(to, newPassword) {
     from: { name: FROM_NAME, address: FROM_EMAIL },
     to,
     replyTo: REPLY_TO,
-    subject: 'Reset de senha - New Store Sorteios',
+    subject: 'Reset de senha - Pixão Na Mão',
     text:
       `Sua senha foi resetada.\n\n` +
       `Nova Senha: ${newPassword}\n\n` +
