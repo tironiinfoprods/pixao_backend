@@ -227,8 +227,8 @@ async function sendResetMailBrevo(to, newPassword) {
   const PASS = process.env.SMTP_PASS || '';          // sua senha/SMTP key do Brevo
 
   // REMETENTE: precisa ser um sender/domínio VALIDADO no Brevo
-  const FROM_EMAIL = process.env.SMTP_FROM || 'contato@newstorerj.com.br';
-  const FROM_NAME  = process.env.SMTP_FROM_NAME || 'New Store Sorteios';
+  const FROM_EMAIL = process.env.SMTP_FROM || 'contato@pixaonamao.com.br';
+  const FROM_NAME  = process.env.SMTP_FROM_NAME || 'Pixão Na Mão';
   const REPLY_TO   = process.env.SMTP_REPLY_TO || FROM_EMAIL;
 
   // Evita usar USER como "from" (causa rejeição 9712be001@smtp-brevo.com)
