@@ -7,77 +7,80 @@ import { requireAuth } from '../middleware/auth.js';
 import { query } from '../db.js';
 
 const router = express.Router();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// resolve diretório do arquivo atual (para não depender só do process.cwd())
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+const exists = (p) => {
+  try { return fs.existsSync(p); } catch { return false; }
+};
 
-// Candidatos de diretórios onde o PDF pode estar no deploy
-const EBOOK_DIR_CANDIDATES = [
-  path.resolve(process.cwd(), 'public', 'ebooks'),
-  path.resolve(process.cwd(), './public/ebooks'),
-  path.resolve(__dirname, '..', '..', 'public', 'ebooks'),
-  path.resolve('.', 'public', 'ebooks'),
-];
-
-function tryFindFile(baseDir, sku) {
+function resolveEbooksDir() {
+  const cwd = process.cwd(); // em Render costuma ser /opt/render/project/src
   const candidates = [
-    `${sku}.pdf`,
-    `${String(sku).toUpperCase()}.pdf`,
-    `${String(sku).toLowerCase()}.pdf`,
-    // tenta título capitalizado (LM-PRATA -> Lm-Prata)
-    `${String(sku).toLowerCase().replace(/\b\w/g, c => c.toUpperCase())}.pdf`,
+    path.join(cwd, 'public', 'ebooks'),                 // ./public/ebooks
+    path.join(cwd, '..', 'public', 'ebooks'),           // ../public/ebooks (quando cwd = ./src)
+    path.join(__dirname, '..', '..', 'public', 'ebooks'), // from src/routes -> ../../public/ebooks
+    path.join(__dirname, '..', 'public', 'ebooks'),     // fallback
+    '/opt/render/project/public/ebooks',                // Render (root sem /src)
   ];
-  for (const name of candidates) {
-    const p = path.join(baseDir, name);
-    if (fs.existsSync(p)) return p;
+
+  for (const d of candidates) {
+    if (exists(d)) return d;
   }
-  return null;
+
+  if (process.env.DEBUG_EBOOKS) {
+    console.log('[ebooks] nenhum diretório encontrado. Verificados:', candidates);
+  }
+  // devolve a primeira opção só para montar o caminho (vai dar 404 depois)
+  return candidates[0];
 }
 
 router.get('/:sku/download', requireAuth, async (req, res) => {
   try {
-    const rawSku = String(req.params.sku || '').trim();
-    // normaliza contra injeção e espaços
-    const sku = rawSku.replace(/[^A-Za-z0-9._-]/g, '');
+    const sku = String(req.params.sku || '').trim();
+    if (!sku) return res.status(400).json({ error: 'bad_sku' });
 
     // 1) Confirma se o usuário tem compra aprovada desse SKU
     const ok = await query(
       `
       SELECT 1
-        FROM payments p
-        JOIN draws d         ON d.id = p.draw_id
-        JOIN infoproducts i  ON i.id = d.infoproduct_id
-       WHERE i.sku = $1
-         AND p.user_id = $2
-         AND LOWER(p.status) IN ('approved','paid','pago')
-       LIMIT 1
+      FROM payments p
+      JOIN draws d        ON d.id = p.draw_id
+      JOIN infoproducts i ON i.id = d.infoproduct_id
+      WHERE i.sku = $1
+        AND p.user_id = $2
+        AND LOWER(p.status) IN ('approved','paid','pago')
+      LIMIT 1
       `,
       [sku, req.user.id]
     );
+    if (!ok.rows?.length) return res.status(403).json({ error: 'no_access' });
 
-    if (!ok.rows.length) {
-      return res.status(403).json({ error: 'no_access' });
-    }
+    // 2) Localiza o arquivo físico
+    const baseDir = resolveEbooksDir();
 
-    // 2) Encontra o arquivo físico (varrendo candidatos)
+    // tenta variações de nome (exato, UPPER, lower)
+    const candidates = [
+      `${sku}.pdf`,
+      `${sku.toUpperCase()}.pdf`,
+      `${sku.toLowerCase()}.pdf`,
+    ];
+
     let filePath = null;
-    for (const base of EBOOK_DIR_CANDIDATES) {
-      const found = tryFindFile(base, sku);
-      // log leve para depurar no Render
-      console.log('[ebooks] check dir:', base, 'found:', !!found);
-      if (found) { filePath = found; break; }
+    for (const name of candidates) {
+      const p = path.join(baseDir, name);
+      if (exists(p)) { filePath = p; break; }
     }
 
     if (!filePath) {
-      console.warn('[ebooks] file not found for SKU:', sku, 'candidates:', EBOOK_DIR_CANDIDATES);
+      if (process.env.DEBUG_EBOOKS) {
+        console.log(`[ebooks] arquivo não encontrado para SKU ${sku}. Testados:`,
+          candidates.map(n => path.join(baseDir, n)));
+      }
       return res.status(404).json({ error: 'file_not_found' });
     }
 
-    // 3) Stream/download
     res.setHeader('Content-Type', 'application/pdf');
-    // Sugere nome do arquivo no download
-    res.setHeader('Content-Disposition', `attachment; filename="${sku}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
     fs.createReadStream(filePath).pipe(res);
   } catch (e) {
     console.error('[ebooks] fail:', e?.message || e);
