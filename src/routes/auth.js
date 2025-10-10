@@ -51,6 +51,68 @@ async function ensureUserColumns() {
   }
 }
 
+// ====== KYC helpers/columns ======
+function onlyDigits(s) {
+  return String(s || '').replace(/\D+/g, '');
+}
+function isValidCPF(raw) {
+  const cpf = onlyDigits(raw);
+  if (!cpf || cpf.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(cpf)) return false;
+
+  // dígito 1
+  let sum = 0;
+  for (let i = 0; i < 9; i++) sum += parseInt(cpf[i], 10) * (10 - i);
+  let d1 = 11 - (sum % 11);
+  if (d1 >= 10) d1 = 0;
+  if (d1 !== parseInt(cpf[9], 10)) return false;
+
+  // dígito 2
+  sum = 0;
+  for (let i = 0; i < 10; i++) sum += parseInt(cpf[i], 10) * (11 - i);
+  let d2 = 11 - (sum % 11);
+  if (d2 >= 10) d2 = 0;
+  return d2 === parseInt(cpf[10], 10);
+}
+function parseBirthdate(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  let y, m, d;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    [y, m, d] = s.split('-').map(Number);
+  } else if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+    const [dd, mm, yy] = s.split('/').map(Number);
+    y = yy; m = mm; d = dd;
+  } else {
+    return null;
+  }
+  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1));
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+function yearsBetween(a, b) {
+  let y = b.getUTCFullYear() - a.getUTCFullYear();
+  const m = b.getUTCMonth() - a.getUTCMonth();
+  const d = b.getUTCDate() - a.getUTCDate();
+  if (m < 0 || (m === 0 && d < 0)) y--;
+  return y;
+}
+async function ensureKycColumns() {
+  try {
+    await query(`
+      ALTER TABLE IF EXISTS users
+        ADD COLUMN IF NOT EXISTS cpf text,
+        ADD COLUMN IF NOT EXISTS cpf_verified boolean DEFAULT false,
+        ADD COLUMN IF NOT EXISTS birthdate date,
+        ADD COLUMN IF NOT EXISTS kyc_status text DEFAULT 'pending'
+    `);
+    await query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS users_cpf_unique_idx ON users (cpf) WHERE cpf IS NOT NULL`
+    );
+  } catch (e) {
+    console.warn('[auth/kyc] ensureKycColumns warn:', e.code || e.message || e);
+  }
+}
+
 // Gera um cupom determinístico por usuário (só se ainda não existir)
 function makeUserCouponCode(userId) {
   const id = Number(userId || 0);
@@ -159,7 +221,6 @@ async function findUserByEmail(emailRaw) {
 }
 
 // ======= envio de e-mail robusto (Brevo) =======
-// ======= envio de e-mail robusto (Brevo) =======
 async function sendResetMailBrevo(to, newPassword) {
   const HOST = process.env.SMTP_HOST || 'smtp-relay.brevo.com';
   const USER = process.env.SMTP_USER || '';          // sua credencial SMTP do Brevo
@@ -211,7 +272,6 @@ async function sendResetMailBrevo(to, newPassword) {
         },
       });
 
-      // Log simples para depurar qual porta deu certo
       console.log(`[reset-password] tentando SMTP ${HOST}:${opt.port} (${opt.label}) from=${FROM_NAME} <${FROM_EMAIL}>`);
 
       await transporter.verify().catch(() => {});
@@ -222,34 +282,68 @@ async function sendResetMailBrevo(to, newPassword) {
     } catch (e) {
       lastErr = e;
       console.warn(`[reset-password] tentativa falhou (${opt.label}):`, e?.code || e?.message || e);
-      // tenta próxima porta
     }
   }
 
   throw lastErr || new Error('smtp_unavailable');
 }
 
-
 // ===================== ROTAS =====================
 
+/**
+ * POST /api/register    (este arquivo costuma ser montado em /api)
+ * Recebe KYC + dados básicos. Mantém as outras rotas inalteradas.
+ */
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, phone } = req.body || {};
-    if (!name || !email || !password) {
+    const {
+      name, email, password, phone,
+      cpf, birthdate, acceptTerms,
+    } = req.body || {};
+
+    if (!name || !email || !password || !phone || !cpf || !birthdate) {
       return res.status(400).json({ error: 'invalid_payload' });
+    }
+    if (!acceptTerms) {
+      return res.status(400).json({ error: 'terms_not_accepted' });
     }
 
     const emailNorm = String(email).trim().toLowerCase();
-    const dupe = await query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [emailNorm]);
-    if (dupe.rows.length) return res.status(409).json({ error: 'email_in_use' });
+    const phoneNorm = onlyDigits(phone);
+    const cpfDigits = onlyDigits(cpf);
+
+    if (!isValidCPF(cpfDigits)) return res.status(400).json({ error: 'invalid_cpf' });
+
+    const bdt = parseBirthdate(birthdate);
+    if (!bdt) return res.status(400).json({ error: 'invalid_birthdate' });
+    const age = yearsBetween(bdt, new Date());
+    if (age < 18) return res.status(400).json({ error: 'underage' });
+
+    await ensureUserColumns();
+    await ensureKycColumns();
+
+    const dupeEmail = await query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [emailNorm]);
+    if (dupeEmail.rows.length) return res.status(409).json({ error: 'email_in_use' });
+
+    const dupeCpf = await query('SELECT 1 FROM users WHERE cpf=$1', [cpfDigits]);
+    if (dupeCpf.rows.length) return res.status(409).json({ error: 'cpf_in_use' });
 
     const hash = await bcrypt.hash(String(password), 10);
     const ins = await query(
-      `INSERT INTO users (name, email, pass_hash, phone)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, name, email, phone,
+      `INSERT INTO users (name, email, pass_hash, phone, cpf, cpf_verified, birthdate, kyc_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, name, email, phone, cpf, cpf_verified, birthdate,
                  CASE WHEN is_admin THEN 'admin' ELSE 'user' END AS role`,
-      [name, emailNorm, hash, String(phone || '').trim() || null]
+      [
+        name,
+        emailNorm,
+        hash,
+        phoneNorm || null,
+        cpfDigits,
+        true,
+        bdt.toISOString().slice(0,10),
+        'verified',
+      ]
     );
 
     const u = ins.rows[0];
@@ -263,7 +357,20 @@ router.post('/register', async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ ok: true, token, user: u });
+    return res.json({
+      ok: true,
+      token,
+      user: {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        phone: u.phone,
+        cpf: u.cpf ? u.cpf.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4') : null,
+        cpf_verified: !!u.cpf_verified,
+        birthdate: u.birthdate,
+      },
+    });
   } catch (e) {
     console.error('[auth] register error', e.code || e.message || e);
     return res.status(503).json({ error: 'db_unavailable' });
@@ -287,7 +394,6 @@ router.post('/login', async (req, res) => {
 
     const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
 
-    // usuário “hidratado” (tolerante a colunas)
     const full = await hydrateUserFromDB(user.id, user.email) || {
       id: user.id, email: user.email, role: user.role || 'user',
     };
@@ -355,7 +461,6 @@ router.post('/reset-password', async (req, res) => {
       console.warn('[reset-password] hashing/update skipped:', e.message);
     }
 
-    // Envio de e-mail com múltiplos fallbacks de porta/TLS
     let delivered = false;
     try {
       delivered = await sendResetMailBrevo(email, newPassword);
