@@ -67,16 +67,20 @@ router.post('/', requireAuth, async (req, res) => {
 
     const ttlMin = Number(process.env.RESERVATION_TTL_MIN || 5);
 
-    // draw aberto
+    // === Garantir que o draw informado existe e está aberto (usa draw_id do body) ===
+    const drawId = Number(req.body?.draw_id);
+    if (!Number.isFinite(drawId)) {
+      return res.status(400).json({ error: 'no_open_draw' });
+    }
     const dr = await query(
-      `SELECT id
+      `SELECT id, status
          FROM draws
-        WHERE status = 'open'
-     ORDER BY id DESC
-        LIMIT 1`
+        WHERE id = $1`,
+      [drawId]
     );
-    if (!dr.rows.length) return res.status(400).json({ error: 'no_open_draw' });
-    const drawId = dr.rows[0].id;
+    if (!dr.rows.length || String(dr.rows[0].status).toLowerCase() !== 'open') {
+      return res.status(400).json({ error: 'no_open_draw' });
+    }
 
     // === INÍCIO TX ===========================================================
     await query('BEGIN');

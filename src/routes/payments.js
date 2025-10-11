@@ -1,4 +1,4 @@
-// src/routes/payments.js
+// backend/src/routes/payments.js
 import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { query } from '../db.js';
@@ -58,25 +58,9 @@ async function finalizeDrawIfComplete(drawId) {
         [drawId]
       );
 
-      const ins = await query(
-        `WITH chk AS (
-           SELECT 1 FROM draws WHERE status = 'open' LIMIT 1
-         )
-         INSERT INTO draws (status)
-         SELECT 'open'
-         WHERE NOT EXISTS (SELECT 1 FROM chk)
-         RETURNING id`
-      );
-
-      const newId = ins.rows[0]?.id;
-      if (newId) {
-        await query(
-          `INSERT INTO numbers (draw_id, n, status)
-           SELECT $1, gs, 'available'
-             FROM generate_series(0, 99) AS gs`,
-          [newId]
-        );
-      }
+      // Removido: criação automática de um "draw aberto global".
+      // O próximo draw deve ser criado pelo fluxo específico do infoproduto
+      // (ex.: /api/infoproducts/:id/ensure-open-draw).
     }
 
     await query('COMMIT');
