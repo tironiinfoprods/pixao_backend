@@ -88,4 +88,37 @@ router.get('/:sku/download', requireAuth, async (req, res) => {
   }
 });
 
+// retorna o link do e-book por sorteio, já validando se o usuário tem acesso
+router.get('/by-draw/:id', requireAuth, async (req, res) => {
+  try {
+    const drawId = Number(req.params.id);
+    if (!Number.isFinite(drawId)) return res.status(400).json({ error: 'bad_draw_id' });
+
+    const r = await query(
+      `
+      SELECT i.sku, COALESCE(i.title, 'E-book') AS title
+      FROM payments p
+      JOIN draws d        ON d.id = p.draw_id
+      JOIN infoproducts i ON i.id = d.infoproduct_id
+      WHERE p.user_id = $1
+        AND d.id = $2
+        AND LOWER(p.status) IN ('approved','paid','pago')
+      LIMIT 1
+      `,
+      [req.user.id, drawId]
+    );
+
+    if (!r.rows?.length) return res.status(403).json({ error: 'no_access' });
+
+    const { sku, title } = r.rows[0];
+    // monta a URL pública do download (ajuste o prefixo se sua API tiver outro basePath)
+    const url = `/api/ebooks/${encodeURIComponent(sku)}/download`;
+    res.json({ title, url, sku });
+  } catch (e) {
+    console.error('[ebooks/by-draw] fail:', e?.message || e);
+    res.status(500).json({ error: 'ebook_link_failed' });
+  }
+});
+
+
 export default router;
