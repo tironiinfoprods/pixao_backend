@@ -49,6 +49,8 @@ import meDraws from "./routes/me_draws.js";
 
 import autopayRunnerRoute from "./routes/autopay_runner.js";
 
+import coversRouter from './routes/covers.js';
+
 import { query, getPool } from "./db.js";
 import { ensureSchema } from "./seed.js";
 import { ensureAppConfig } from "./services/config.js";
@@ -120,7 +122,7 @@ app.use("/api/admin/dashboard", adminDashboardRouter);
 
 app.use('/api/ebooks', ebooksRouter);
 
-
+app.use('/public/covers', coversRouter);
 
 // ✅ Config (pública e admin) — rota pública MONTADA UMA ÚNICA VEZ
 app.use("/api/config", configRouter);           // GET: preço, banner, max_select | POST: atualiza
