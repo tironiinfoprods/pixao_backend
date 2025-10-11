@@ -88,6 +88,108 @@ async function settleApprovedPayment(id, drawId, numbers) {
   );
 }
 
+/* ============================================================================
+   >>> ADIÇÃO: Reconciliação automática de PIX pendentes <<<
+   - Throttle por tempo (para não sobrecarregar)
+   - Varrendo apenas pagamentos com draw_id (reservas de números)
+   - Atualiza payments.status / numbers / reservations e finaliza draw
+   - Disparo oportunista em todas as rotas deste router (router.use)
+   - Opcional: timer por intervalo (AUTO_RECONCILE_INTERVAL_MS)
+   ========================================================================== */
+
+const RECONCILE_MIN_INTERVAL_MS   = Number(process.env.RECONCILE_MIN_INTERVAL_MS || 45000); // 45s
+const RECONCILE_LOOKBACK_MINUTES  = Number(process.env.RECONCILE_LOOKBACK_MINUTES || 1440); // 24h
+const RECONCILE_BATCH_MAX         = Number(process.env.RECONCILE_BATCH_MAX || 25);
+const AUTO_RECONCILE_INTERVAL_MS  = Number(process.env.AUTO_RECONCILE_INTERVAL_MS || 0);   // 0 = desliga
+
+let _reconLastAt = 0;
+let _reconInFlight = false;
+
+/** Exportado para uso externo opcional (ex.: outro middleware). */
+export async function kickReconcilePendingPayments(force = false) {
+  const now = Date.now();
+  if (!force) {
+    if (_reconInFlight) return { skipped: true, reason: 'in_flight' };
+    if (now - _reconLastAt < RECONCILE_MIN_INTERVAL_MS) return { skipped: true, reason: 'throttled' };
+  }
+  _reconInFlight = true;
+  _reconLastAt = now;
+
+  try {
+    const { rows } = await query(
+      `SELECT id
+         FROM payments
+        WHERE draw_id IS NOT NULL
+          AND lower(status) NOT IN ('approved','paid','pago')
+          AND COALESCE(created_at, now()) >= NOW() - ($1::int || ' minutes')::interval
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [RECONCILE_LOOKBACK_MINUTES, RECONCILE_BATCH_MAX]
+    );
+
+    let scanned = rows.length, updated = 0, approved = 0, failed = 0;
+
+    for (const { id } of rows) {
+      try {
+        const resp = await mpPayment.get({ id: String(id) });
+        const body = resp?.body || resp;
+        const st = String(body?.status || '').toLowerCase();
+
+        await query(
+          `UPDATE payments
+              SET status = $2,
+                  paid_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE paid_at END
+            WHERE id = $1`,
+          [id, st]
+        );
+        updated++;
+
+        if (st === 'approved') {
+          const pr = await query(`SELECT draw_id, numbers FROM payments WHERE id = $1`, [id]);
+          if (pr.rows.length) {
+            const { draw_id, numbers } = pr.rows[0];
+            await settleApprovedPayment(id, draw_id, numbers);
+            await finalizeDrawIfComplete(draw_id);
+            approved++;
+          }
+        }
+      } catch (e) {
+        failed++;
+        console.warn('[payments:auto-reconcile] error for', id, e?.message || e);
+      }
+    }
+
+    return { scanned, updated, approved, failed };
+  } catch (e) {
+    console.warn('[payments:auto-reconcile] fatal:', e?.message || e);
+    return { error: true };
+  } finally {
+    _reconInFlight = false;
+  }
+}
+
+// dispara reconciliação em segundo plano a cada hit neste router
+router.use((req, res, next) => {
+  if (process.env.AUTO_RECONCILE_ON_HIT !== 'false') {
+    kickReconcilePendingPayments().catch((e) =>
+      console.warn('[payments:auto-reconcile on hit]', e?.message || e)
+    );
+  }
+  next();
+});
+
+// timer opcional por intervalo (desligado por padrão)
+if (AUTO_RECONCILE_INTERVAL_MS > 0) {
+  const t = setInterval(() => {
+    kickReconcilePendingPayments().catch((e) =>
+      console.warn('[payments:auto-reconcile timer]', e?.message || e)
+    );
+  }, AUTO_RECONCILE_INTERVAL_MS);
+  // evitar manter o processo vivo só por causa do timer
+  if (typeof t.unref === 'function') t.unref();
+}
+/* ============================ FIM DA ADIÇÃO ============================ */
+
 // -----------------------------------------------------------------------------
 // Rotas
 // -----------------------------------------------------------------------------
